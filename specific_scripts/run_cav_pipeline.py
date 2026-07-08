@@ -51,7 +51,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "tcav"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 from src.train_cav import train_cav
 from src.evaluate import load_cav_artifacts, compute_projections
 from src.utils.data_loader import load_sequence_embeddings

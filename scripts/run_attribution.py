@@ -49,7 +49,7 @@ import argparse
 import logging
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "tcav"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 
 from src.utils.data_loader import load_embeddings_pkl
 from src.evaluate import load_cav_artifacts

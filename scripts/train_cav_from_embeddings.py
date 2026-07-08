@@ -34,7 +34,7 @@ import logging
 import numpy as np
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "tcav"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 
 from src.train_cav import train_cav
 from src.utils.data_loader import load_sequence_embeddings

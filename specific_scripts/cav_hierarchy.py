@@ -66,7 +66,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "tcav"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 from src.utils.data_loader import load_sequence_embeddings
 from src.utils.preprocessing import preprocess_embeddings
 

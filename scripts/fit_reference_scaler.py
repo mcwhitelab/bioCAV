@@ -19,7 +19,7 @@ import logging
 import joblib
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "tcav"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 
 from src.utils.data_loader import load_sequence_embeddings
 from src.utils.preprocessing import create_scaler_and_pca

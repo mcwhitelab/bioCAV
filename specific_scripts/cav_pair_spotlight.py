@@ -41,7 +41,7 @@ import matplotlib.patches as mpatches
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "tcav"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 from src.utils.data_loader import load_sequence_embeddings
 
 logging.basicConfig(level=logging.INFO,

@@ -25,7 +25,10 @@ set -euo pipefail
 conda activate /groups/clairemcwhite/envs/core_pkgs4
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
-tcav_dir=/groups/clairemcwhite/claire_workspace/github/TCAV_ss
+# This script is copied out of the repo before use (see docs/run_single_cav.md),
+# so biocav_dir can't be self-located from this file's own path — it's a real
+# hardcoded path to the current bioCAV checkout.
+biocav_dir=/groups/clairemcwhite/cav_workspace/bioCAV
 ref_neg=reference_population/neg_10000.pkl
 embed_script=/groups/clairemcwhite/claire_workspace/github/mcwlab_utils/hf_embed_new.py
 model=/groups/clairemcwhite/models/ESMplusplus_large
@@ -42,7 +45,7 @@ CAV_DIR=${SPAN_FILE%.span}_cav
 if [ -f "$FASTA_FILE" ]; then
     echo "Skipping FASTA retrieval: $FASTA_FILE already exists"
 else
-    python $tcav_dir/specific_scripts/retrieve_fasta.py \
+    python $biocav_dir/specific_scripts/retrieve_fasta.py \
         $SPAN_FILE $FASTA_FILE
 fi
 
@@ -69,7 +72,7 @@ fi
 # -------------
 ### Step 3: Pool embeddings by span → positive embedding matrix
 # -------------
-python $tcav_dir/scripts/prepare_embeddings.py \
+python $biocav_dir/scripts/prepare_embeddings.py \
     --pkl  $PKL_FILE \
     --info ${PKL_FILE}.seqnames \
     --spans $SPAN_FILE \
@@ -78,7 +81,7 @@ python $tcav_dir/scripts/prepare_embeddings.py \
 # -------------
 ### Step 4: Train CAV
 # -------------
-python $tcav_dir/scripts/train_cav_from_embeddings.py \
+python $biocav_dir/scripts/train_cav_from_embeddings.py \
     --pos  $POS_NPY \
     --neg  $ref_neg \
     --out  $CAV_DIR \

@@ -14,7 +14,7 @@ We present an automated approach for identifying and annotating motifs and domai
 ## Repository Structure
 
 ```
-├── tcav/                    # Core TCAV implementation
+├── core/                    # Core CAV implementation
 │   └── src/                 # Source modules (attribution, detection, training, evaluation)
 ├── scripts/                 # Core pipeline scripts
 │   ├── prepare_embeddings.py        # Pool per-residue embeddings by span
@@ -34,8 +34,8 @@ We present an automated approach for identifying and annotating motifs and domai
 
 ```bash
 git clone <repository-url>
-cd TCAV_ss
-pip install -r tcav/requirements.txt
+cd bioCAV
+pip install -r core/requirements.txt
 ```
 
 ## Pipeline
@@ -52,7 +52,7 @@ conda activate /groups/clairemcwhite/envs/core_pkgs4
 f=/groups/clairemcwhite/ahmad_workspace/esm_c/neg_data/neg_10000.fasta
 
 # Select layer -11 (second-to-last layer), as in the paper
-python /groups/clairemcwhite/mcwlab_utils/hf_embed_new.py \
+python /groups/clairemcwhite/claire_workspace/github/mcwlab_utils/hf_embed_new.py \
     -f $f \
     -o reference_population/neg_10000.pkl \
     -ss mean \
@@ -85,7 +85,7 @@ python /groups/clairemcwhite/claire_workspace/github/mcwlab_utils/hf_embed_new.p
 Extract the region(s) defined in your span file and pool them into a positive embedding matrix.
 
 ```bash
-python $tcav_dir/scripts/prepare_embeddings.py \
+python $biocav_dir/scripts/prepare_embeddings.py \
     --pkl   ${INPUT_FASTA}.pkl \
     --info  ${INPUT_FASTA}.pkl.seqnames \
     --spans $SPAN_FILE \
@@ -97,7 +97,7 @@ python $tcav_dir/scripts/prepare_embeddings.py \
 Train a linear classifier (CAV) separating the positive span embeddings from the reference negative population.
 
 ```bash
-python $tcav_dir/scripts/train_cav_from_embeddings.py \
+python $biocav_dir/scripts/train_cav_from_embeddings.py \
     --pos     ${SPAN_FILE%.spans}_pos.npy \
     --neg     $ref_neg \
     --out     $concept_dir \
@@ -132,7 +132,7 @@ fi
 Score and rank every sequence (or every sliding window) in the search set against the trained CAV.
 
 ```bash
-python $tcav_dir/specific_scripts/query_proteins_by_cav.py \
+python $biocav_dir/specific_scripts/query_proteins_by_cav.py \
     --cav   $concept_dir \
     --pkl   $search_pkl \
     --out   $out_tsv \
@@ -163,7 +163,7 @@ source ~/.bashrc
 conda activate /groups/clairemcwhite/envs/core_pkgs4
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
-tcav_dir=/groups/clairemcwhite/claire_workspace/github/TCAV_ss
+biocav_dir=/groups/clairemcwhite/cav_workspace/bioCAV
 ref_neg=reference_population/neg_10000.pkl
 ref_pca=reference_population/global_pca_v1.pkl
 
@@ -184,12 +184,12 @@ else
 fi
 
 # Step 02
-python $tcav_dir/scripts/prepare_embeddings.py \
+python $biocav_dir/scripts/prepare_embeddings.py \
     --pkl ${INPUT_FASTA}.pkl --info ${INPUT_FASTA}.pkl.seqnames \
     --spans $SPAN_FILE --out ${SPAN_FILE%.spans}_pos.npy
 
 # Step 03
-python $tcav_dir/scripts/train_cav_from_embeddings.py \
+python $biocav_dir/scripts/train_cav_from_embeddings.py \
     --pos ${SPAN_FILE%.spans}_pos.npy --neg $ref_neg \
     --out $concept_dir --cv-folds 0 --pca-pkl $ref_pca
 
@@ -205,7 +205,7 @@ else
 fi
 
 # Step 05
-python $tcav_dir/specific_scripts/query_proteins_by_cav.py \
+python $biocav_dir/specific_scripts/query_proteins_by_cav.py \
     --cav $concept_dir --pkl $search_pkl --out $out_tsv \
     --k -1 --sliding-window --spans $SPAN_FILE --fasta $SEARCH_FASTA
 ```

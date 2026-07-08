@@ -485,7 +485,7 @@ def make_rank_scatter(
     import glob as _glob
     import joblib
     import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent / "tcav"))
+    sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
     from src.utils.data_loader import load_sequence_embeddings
 
     CAV_SUBDIR = "random_positive_train_max1000_cav"

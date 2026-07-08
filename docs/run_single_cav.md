@@ -7,8 +7,8 @@ custom set of positive proteins and querying a FASTA of interest against it.
 > in `specific_scripts/` are templates — do not edit or run them in place.
 > Copy them to your working directory first:
 > ```bash
-> cp $tcav_dir/specific_scripts/train_cav_from_span.sh .
-> cp $tcav_dir/specific_scripts/run_spanfile.sbatch .
+> cp $biocav_dir/specific_scripts/train_cav_from_span.sh .
+> cp $biocav_dir/specific_scripts/run_spanfile.sbatch .
 > ```
 > This keeps the originals intact and lets you customise paths for your project.
 
@@ -56,7 +56,7 @@ reference_population/scaler_v1.pkl   ← shared scaler (passed via --scaler-pkl)
 ```
 
 ```bash
-bash $tcav_dir/specific_scripts/train_cav_from_span.sh \
+bash $biocav_dir/specific_scripts/train_cav_from_span.sh \
     my_concept.span \
     --scaler-pkl reference_population/scaler_v1.pkl
 ```
@@ -92,7 +92,7 @@ my_concept_cav/
 Score a FASTA of proteins against the trained CAV:
 
 ```bash
-python $tcav_dir/specific_scripts/query_proteins_by_cav.py \
+python $biocav_dir/specific_scripts/query_proteins_by_cav.py \
     --cav  my_concept_cav/ \
     --pkl  my_search_proteins.fasta.pkl \
     --out  my_concept_query_results.tsv \
@@ -130,7 +130,7 @@ For large FASTAs or many proteins, use the SLURM template. Copy it to your
 working directory before editing — do not run it directly from `specific_scripts/`:
 
 ```bash
-cp $tcav_dir/specific_scripts/run_spanfile.sbatch my_job.sbatch
+cp $biocav_dir/specific_scripts/run_spanfile.sbatch my_job.sbatch
 # Edit SPAN_FILE, INPUT_FASTA, SEARCH_FASTA at the top of my_job.sbatch
 sbatch my_job.sbatch
 ```

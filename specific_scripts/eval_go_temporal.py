@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 import scipy.stats as stats
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "tcav"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 from src.evaluate import load_cav_artifacts, compute_projections
 from src.utils.data_loader import load_sequence_embeddings
 
@@ -234,7 +234,7 @@ def main():
                         help="Restrict to direct/experimental ECO evidence codes. "
                              "Off by default (use when your file is not already pre-filtered).")
     parser.add_argument("--retrieve-script",
-                        default="/groups/clairemcwhite/claire_workspace/github/TCAV_ss/specific_scripts/retrieve_fasta.py",
+                        default=str(Path(__file__).parent / "retrieve_fasta.py"),
                         help="Path to retrieve_fasta.py.")
     parser.add_argument("--embed-script",
                         default="/groups/clairemcwhite/claire_workspace/github/mcwlab_utils/hf_embed_new.py",
