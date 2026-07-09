@@ -22,7 +22,11 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
+# Archived: not called by any live pipeline. Also predates the scaler-only
+# simplification of compute_projections()/load_cav_artifacts() -- the
+# artifacts['pca'] call below is broken (that key no longer exists) and
+# was not fixed, since this script isn't in use.
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "core"))
 
 from src.evaluate import load_cav_artifacts, compute_projections
 from src.utils.data_loader import load_sequence_embeddings

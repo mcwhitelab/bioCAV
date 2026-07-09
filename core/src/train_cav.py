@@ -14,7 +14,7 @@ from sklearn.model_selection import cross_val_score, StratifiedKFold, train_test
 from sklearn.metrics import roc_auc_score, average_precision_score
 import hashlib
 
-from .utils.preprocessing import create_scaler_and_pca
+from .utils.preprocessing import create_scaler
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +237,7 @@ def train_cav(
         X_holdout, y_holdout = None, None
 
     if scaler is None:
-        scaler, preprocess_meta = create_scaler_and_pca(X_train)
+        scaler, preprocess_meta = create_scaler(X_train)
     else:
         preprocess_meta = {'global_scaler': True}
         logger.info("Using pre-fit global scaler")

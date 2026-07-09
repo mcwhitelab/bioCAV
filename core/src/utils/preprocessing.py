@@ -8,7 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def create_scaler_and_pca(
+def create_scaler(
     X_train: np.ndarray,
 ) -> Tuple[StandardScaler, dict]:
     """

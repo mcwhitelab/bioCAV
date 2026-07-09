@@ -28,9 +28,9 @@ independent of cell-type and tissue context.
 
 Prerequisites
 -------------
-All CAVs in the library must have been trained with the same global PCA
-(--pca-pkl reference_population/global_pca_v1.pkl). The concept vectors are
-then all in the same 128-D PCA space and can be compared directly.
+All CAVs in the library must have been trained with the same global scaler
+(--scaler-pkl reference_population/global_scaler_v1.pkl). The concept vectors
+are then all in the same coordinate system and can be compared directly.
 
 Usage
 -----
@@ -140,7 +140,7 @@ def discover_cavs(lib_dir: Path, version: str = "v1") -> Dict[str, tuple]:
 # ===========================================================================
 
 def load_cav_direction(cav_dir: Path, version: str = "v1") -> np.ndarray:
-    """Load and unit-normalise the concept vector (in PCA space)."""
+    """Load and unit-normalise the concept vector (in shared scaler space)."""
     v = np.load(cav_dir / f"concept_{version}.npy").astype(np.float64)
     norm = np.linalg.norm(v)
     if norm < 1e-10:
@@ -155,7 +155,7 @@ def load_all_directions(
 ) -> Dict[str, np.ndarray]:
     """
     Return {cav_name: unit_vector} for all named CAVs.
-    Vectors are in the shared PCA space (128-D by default).
+    Vectors are in the shared scaler space.
     """
     cavs_dir = lib_dir / "cavs"
     dirs = {}
@@ -357,7 +357,6 @@ def project_cells(
     cell_ids: List[str],
     hierarchy: Dict,
     scaler,
-    pca,
 ) -> pd.DataFrame:
     """
     Project each cell's embedding onto every axis in the hierarchy.
@@ -367,7 +366,7 @@ def project_cells(
     embs_raw : (n_cells, hidden_dim) raw Geneformer embeddings
     cell_ids : list of cell ID strings
     hierarchy: output of build_hierarchy()
-    scaler, pca: fitted sklearn objects (global PCA)
+    scaler: fitted sklearn StandardScaler (global scaler)
 
     Returns
     -------
@@ -378,8 +377,8 @@ def project_cells(
         L2__{cell_type}__{tissue}__{disease} for each L2 axis
         delta__{cell_type}__{tissue}__{disease} for each delta axis
     """
-    # Transform raw embeddings into PCA space
-    X = preprocess_embeddings(embs_raw, scaler, pca)   # (n, pca_dim)
+    # Transform raw embeddings into the shared scaler space
+    X = preprocess_embeddings(embs_raw, scaler)   # (n, hidden_dim)
 
     rows = {"cell_id": cell_ids}
 
@@ -424,7 +423,6 @@ def compute_gene_correlations(
     cell_ids: List[str],
     h5ad_path: str,
     scaler,
-    pca,
     top_n: Optional[int] = None,
 ) -> Dict[str, pd.DataFrame]:
     """
@@ -452,7 +450,7 @@ def compute_gene_correlations(
         logger.warning(f"{n_dropped} cells not found in h5ad — using {len(keep_ids)}")
 
     X_emb_sub = embs_raw[keep_idx]
-    X_pca     = preprocess_embeddings(X_emb_sub, scaler, pca)
+    X_scaled     = preprocess_embeddings(X_emb_sub, scaler)
     adata_sub = adata[keep_ids]
     X_expr    = (
         adata_sub.X.toarray()
@@ -489,19 +487,19 @@ def compute_gene_correlations(
     # Level 0
     for ct, v in sorted(hierarchy["L0"].items()):
         label = f"L0__{ct}"
-        results[label] = _corr_df(X_pca @ v, label)
+        results[label] = _corr_df(X_scaled @ v, label)
 
     # Level 1
     for (ct, tissue), v in sorted(hierarchy["L1"].items()):
         label = f"L1__{ct}__{tissue}"
-        results[label] = _corr_df(X_pca @ v, label)
+        results[label] = _corr_df(X_scaled @ v, label)
 
     # Level 2 — use delta where available, otherwise the raw L2 residual
     for (ct, tissue, disease), v in sorted(hierarchy["L2"].items()):
         delta_v = hierarchy["delta"].get((ct, tissue, disease))
         use_v   = delta_v if delta_v is not None else v
         label   = f"L2__{ct}__{tissue}__{disease}"
-        results[label] = _corr_df(X_pca @ use_v, label)
+        results[label] = _corr_df(X_scaled @ use_v, label)
 
     return results
 
@@ -517,7 +515,7 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument("--lib-dir", required=True,
-                        help="CAV library directory (contains cavs/ and global_pca_v1.pkl).")
+                        help="CAV library directory (contains cavs/ and global_scaler_v1.pkl).")
     parser.add_argument("--pkl", required=True,
                         help="Embedding pkl file for cells to project.")
     parser.add_argument("--out", required=True,
@@ -529,9 +527,9 @@ def main():
     parser.add_argument("--top-n", type=int, default=None,
                         help="Keep only the top N genes by |pearson_r| in gene correlation "
                              "output (default: all genes).")
-    parser.add_argument("--pca-pkl", default=None,
-                        help="Path to global PCA pkl (scaler + PCA). Defaults to "
-                             "lib_dir/global_pca_v1.pkl.")
+    parser.add_argument("--scaler-pkl", default=None,
+                        help="Path to global scaler pkl. Defaults to "
+                             "lib_dir/global_scaler_v1.pkl.")
     parser.add_argument("--level-order",
                         choices=["group-context-condition",
                                  "context-group-condition"],
@@ -547,20 +545,19 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ #
-    # 1. Load global PCA
+    # 1. Load global scaler
     # ------------------------------------------------------------------ #
     import joblib
 
-    pca_pkl = Path(args.pca_pkl) if args.pca_pkl else lib_dir / "global_pca_v1.pkl"
-    if not pca_pkl.exists():
+    scaler_pkl = Path(args.scaler_pkl) if args.scaler_pkl else lib_dir / "global_scaler_v1.pkl"
+    if not scaler_pkl.exists():
         raise FileNotFoundError(
-            f"Global PCA not found: {pca_pkl}\n"
-            f"Pass --pca-pkl or ensure lib_dir/global_pca_v1.pkl exists."
+            f"Global scaler not found: {scaler_pkl}\n"
+            f"Pass --scaler-pkl or ensure lib_dir/global_scaler_v1.pkl exists."
         )
-    logger.info(f"Loading global PCA from {pca_pkl}")
-    pca_artifacts = joblib.load(pca_pkl)
-    scaler = pca_artifacts["scaler"]
-    pca    = pca_artifacts["pca"]
+    logger.info(f"Loading global scaler from {scaler_pkl}")
+    scaler_artifacts = joblib.load(scaler_pkl)
+    scaler = scaler_artifacts["scaler"]
 
     # ------------------------------------------------------------------ #
     # 2. Discover and load CAV directions
@@ -588,7 +585,7 @@ def main():
     embs_raw, cell_ids = load_sequence_embeddings(args.pkl)
     logger.info(f"  {len(cell_ids)} cells, hidden_dim={embs_raw.shape[1]}")
 
-    coords_df = project_cells(embs_raw, cell_ids, hierarchy, scaler, pca)
+    coords_df = project_cells(embs_raw, cell_ids, hierarchy, scaler)
     coords_path = out_dir / "cell_coordinates.tsv"
     coords_df.to_csv(coords_path, sep="\t", index=False, float_format="%.4f")
     logger.info(f"Saved cell coordinates: {coords_path}  ({coords_df.shape})")
@@ -600,7 +597,7 @@ def main():
         logger.info("Computing gene correlations at each level...")
         gene_results = compute_gene_correlations(
             hierarchy, embs_raw, cell_ids,
-            args.h5ad, scaler, pca,
+            args.h5ad, scaler,
             top_n=args.top_n,
         )
 

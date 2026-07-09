@@ -22,7 +22,7 @@ python specific_scripts/build_reference_population.py \\
 
 # Produces:
 #   reference_population/embeddings/cells.pkl  — reference embeddings
-#   reference_population/global_pca_v1.pkl     — scaler+PCA fit on those embeddings
+#   reference_population/global_scaler_v1.pkl  — scaler fit on those embeddings
 
 # Then use with run_cav_pipeline.py:
 python specific_scripts/run_cav_pipeline.py \\
@@ -30,7 +30,7 @@ python specific_scripts/run_cav_pipeline.py \\
     --model         /path/to/geneformer_model \\
     --dataset-id    <dataset_id> \\
     --reference-pkl reference_population/embeddings/cells.pkl \\
-    --pca-pkl       reference_population/global_pca_v1.pkl
+    --scaler-pkl    reference_population/global_scaler_v1.pkl
 """
 
 import argparse
@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 from src.utils.data_loader import load_sequence_embeddings
+from src.utils.preprocessing import create_scaler
 
 
 # ===========================================================================
@@ -149,30 +150,21 @@ def embed(h5ad_path, out_dir, model_path, token_dict_path=None):
 
 
 # ===========================================================================
-# Step 4: fit global PCA on reference embeddings
+# Step 4: fit global scaler on reference embeddings
 # ===========================================================================
 
-def fit_global_pca(embs, out_path, pca_dim=128, seed=42):
-    """Fit StandardScaler + PCA on reference embeddings and save to out_path."""
+def fit_global_scaler(embs, out_path):
+    """Fit a StandardScaler on reference embeddings and save to out_path."""
     import joblib
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.decomposition import PCA
 
     out_path = Path(out_path)
-    logger.info(f"Fitting global PCA on {len(embs):,} cells x {embs.shape[1]} dims...")
+    logger.info(f"Fitting global scaler on {len(embs):,} cells x {embs.shape[1]} dims...")
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(embs)
+    scaler, _ = create_scaler(embs)
 
-    actual_dim = min(pca_dim, embs.shape[0], embs.shape[1])
-    pca = PCA(n_components=actual_dim, random_state=seed)
-    pca.fit(X_scaled)
-    var_explained = pca.explained_variance_ratio_.sum()
-    logger.info(f"  PCA({actual_dim}) explains {var_explained:.1%} of variance")
-
-    joblib.dump({"scaler": scaler, "pca": pca}, out_path)
+    joblib.dump({"scaler": scaler}, out_path)
     logger.info(f"  Saved: {out_path}")
-    return scaler, pca
+    return scaler
 
 
 # ===========================================================================
@@ -197,8 +189,6 @@ def main():
                         help="Random seed for cell sampling (default: 42)")
     parser.add_argument("--census-version", default="stable",
                         help="CellxGene Census version (default: stable)")
-    parser.add_argument("--pca-dim", type=int, default=128,
-                        help="PCA dimensionality for global PCA (default: 128)")
     parser.add_argument("--delete-h5ad", action="store_true",
                         help="Delete reference.h5ad after embedding to save disk space "
                              "(kept by default)")
@@ -241,16 +231,16 @@ def main():
         embed(h5ad_path, out_dir / "embeddings", args.model, args.token_dict)
 
     # ------------------------------------------------------------------ #
-    # 4. Fit global PCA (idempotent)
+    # 4. Fit global scaler (idempotent)
     # ------------------------------------------------------------------ #
-    pca_path = out_dir / "global_pca_v1.pkl"
+    scaler_path = out_dir / "global_scaler_v1.pkl"
     embs, cell_ids = load_sequence_embeddings(str(pkl_path))
     logger.info(f"\nReference embeddings: {len(cell_ids):,} cells, dim={embs.shape[1]}")
 
-    if pca_path.exists():
-        logger.info(f"Global PCA already exists, skipping: {pca_path}")
+    if scaler_path.exists():
+        logger.info(f"Global scaler already exists, skipping: {scaler_path}")
     else:
-        fit_global_pca(embs, pca_path, pca_dim=args.pca_dim)
+        fit_global_scaler(embs, scaler_path)
 
     # ------------------------------------------------------------------ #
     # 5. Verify
@@ -259,7 +249,7 @@ def main():
     logger.info(f"  Cells embedded : {len(cell_ids):,}")
     logger.info(f"  Embedding dim  : {embs.shape[1]}")
     logger.info(f"  embeddings pkl : {pkl_path}")
-    logger.info(f"  global PCA pkl : {pca_path}")
+    logger.info(f"  global scaler pkl : {scaler_path}")
 
     if args.delete_h5ad and h5ad_path.exists():
         h5ad_path.unlink()
@@ -267,7 +257,7 @@ def main():
 
     print(f"\nDone. Pass to run_cav_pipeline.py with:")
     print(f"  --reference-pkl {pkl_path}")
-    print(f"  --pca-pkl       {pca_path}")
+    print(f"  --scaler-pkl    {scaler_path}")
 
 
 if __name__ == "__main__":

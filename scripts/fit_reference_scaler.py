@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 
 from src.utils.data_loader import load_sequence_embeddings
-from src.utils.preprocessing import create_scaler_and_pca
+from src.utils.preprocessing import create_scaler
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ def main():
     embs, ids = load_sequence_embeddings(args.neg)
     logger.info(f"Loaded {len(ids)} reference embeddings, dim={embs.shape[1]}")
 
-    scaler, meta = create_scaler_and_pca(embs)
+    scaler, meta = create_scaler(embs)
     logger.info(f"Fitted StandardScaler: mean range [{embs.mean(axis=0).min():.4f}, "
                 f"{embs.mean(axis=0).max():.4f}]")
 
