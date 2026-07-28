@@ -47,6 +47,7 @@ import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import seaborn as sns
 import scipy.stats as stats
 
@@ -288,6 +289,130 @@ def run_wilcoxon_pair(adata_pair, condition_col: str,
     })
 
 
+def run_mixedlm_pair(adata_pair, donor_col: str,
+                     condition_col: str, baseline_value: str,
+                     gene_ids: Optional[List[str]] = None,
+                     min_donors: int = 3,
+                     min_pct_cells: float = 0.01) -> Optional[pd.DataFrame]:
+    """
+    Per-gene linear mixed model: log2(CPM-normalised expr + 1) ~ condition,
+    with a random intercept per donor.
+
+    Rationale: naive per-cell tests (e.g. Wilcoxon on cells) treat every cell
+    as an independent observation, which is pseudoreplication -- cells from
+    the same donor share donor-level biology/technical variation, so p-values
+    from a per-cell test are anti-conservative. Pseudobulk (DESeq2) is the
+    conservative fix -- it collapses to one point per donor -- but that can
+    make it badly underpowered when donor counts are modest (e.g. 9 vs. 13),
+    even for a real, biologically large effect. A mixed model is the middle
+    ground: it uses every cell (so it has much more power than pseudobulk)
+    while still modelling donor as the correct unit of non-independence via
+    the random intercept, so it doesn't overstate significance the way a
+    naive per-cell test does.
+
+    Returns DataFrame with gene, log2fc, pval, padj, converged, or None if
+    insufficient donors.
+    """
+    import scipy.sparse as sp
+    import statsmodels.formula.api as smf
+    import warnings
+
+    obs = adata_pair.obs.copy()
+    obs["_condition"] = obs[condition_col].astype(str)
+    obs["_donor"]     = obs[donor_col].astype(str)
+
+    conditions = obs["_condition"].unique()
+    n_cond = {c: obs[obs["_condition"] == c]["_donor"].nunique() for c in conditions}
+    min_n  = min(n_cond.values()) if n_cond else 0
+    if min_n < min_donors:
+        logger.warning(f"  Insufficient donors per condition {dict(n_cond)} "
+                       f"(need ≥ {min_donors}) — skipping mixed model")
+        return None
+
+    # Manual CPM-style total-count normalisation (avoids a scanpy import --
+    # this environment has a scanpy/anndata version conflict unrelated to
+    # this analysis). Library size is computed from ALL genes before any
+    # gene subsetting below.
+    X_full = adata_pair.X
+    if sp.issparse(X_full):
+        X_full = X_full.toarray()
+    X_full = X_full.astype(np.float64)
+    lib_size = X_full.sum(axis=1, keepdims=True)
+    lib_size[lib_size == 0] = 1.0
+    target_sum = 1e4
+    X_norm = X_full / lib_size * target_sum
+
+    gene_names_all = list(adata_pair.var_names)
+    if gene_ids:
+        keep_idx = [i for i, g in enumerate(gene_names_all) if g in set(gene_ids)]
+        if not keep_idx:
+            logger.warning("  None of the requested gene_ids found in var_names")
+            return None
+        X_full  = X_full[:, keep_idx]
+        X_norm  = X_norm[:, keep_idx]
+        gene_names_all = [gene_names_all[i] for i in keep_idx]
+
+    # Detection-rate pre-filter: skip genes barely/never detected in this
+    # pair -- a full mixed-model fit on an all-zero (or near-zero) gene is
+    # wasted time and won't converge to anything meaningful anyway.
+    n_cells   = X_full.shape[0]
+    detected  = (X_full > 0).sum(axis=0)
+    keep_expr = detected >= max(1, int(min_pct_cells * n_cells))
+    if not keep_expr.all():
+        logger.info(f"  Detection filter (≥{min_pct_cells:.0%} of {n_cells} cells): "
+                    f"{keep_expr.sum()}/{len(keep_expr)} genes kept")
+    X_norm = X_norm[:, keep_expr]
+    gene_names_all = [g for g, k in zip(gene_names_all, keep_expr) if k]
+
+    X = np.log2(X_norm + 1.0)
+
+    is_baseline = np.array([norm(v) == norm(baseline_value) for v in obs["_condition"]])
+    df_base = pd.DataFrame({
+        "condition": (~is_baseline).astype(int),
+        "donor":     obs["_donor"].values,
+    })
+
+    logger.info(f"  MixedLM: {(~is_baseline).sum()} condition, {is_baseline.sum()} "
+                f"baseline cells across {obs['_donor'].nunique()} donors, "
+                f"{len(gene_names_all)} genes")
+
+    rows = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for i, gene in enumerate(gene_names_all):
+            df = df_base.copy()
+            df["expr"] = X[:, i]
+            if df["expr"].std() == 0:
+                rows.append({"gene": gene, "log2fc": 0.0, "pval": 1.0,
+                            "converged": False})
+                continue
+            try:
+                model  = smf.mixedlm("expr ~ condition", df, groups=df["donor"])
+                result = model.fit(reml=True, method="lbfgs")
+                coef   = result.fe_params.get("condition", np.nan)
+                pval   = result.pvalues.get("condition", np.nan)
+                rows.append({"gene": gene, "log2fc": coef, "pval": pval,
+                            "converged": result.converged})
+            except Exception as e:
+                rows.append({"gene": gene, "log2fc": np.nan, "pval": np.nan,
+                            "converged": False})
+
+    result_df = pd.DataFrame(rows).dropna(subset=["pval"])
+    if result_df.empty:
+        logger.warning("  No genes converged — skipping")
+        return None
+
+    from statsmodels.stats.multitest import multipletests
+    _, padj, _, _ = multipletests(result_df["pval"], method="fdr_bh")
+    result_df["padj"] = padj
+
+    n_failed = (~result_df["converged"]).sum()
+    if n_failed:
+        logger.warning(f"  {n_failed}/{len(result_df)} genes did not converge")
+
+    return result_df[["gene", "log2fc", "pval", "padj", "converged"]]
+
+
 # ---------------------------------------------------------------------------
 # Summary heatmap
 # ---------------------------------------------------------------------------
@@ -324,11 +449,25 @@ def make_summary_heatmap(lfc_matrix: pd.DataFrame, out_path: str,
 # CAV comparison
 # ---------------------------------------------------------------------------
 
+def continuum_genes_for_pair(cav: pd.DataFrame, top_n_each: int) -> pd.DataFrame:
+    """Reproduce the exact gene selection used by cav_continuum_viz.py's
+    load_gene_corr(top_n_each=...): top-N by positive r + top-N by negative r.
+    Returns the selected rows (with a 'gene' column) from the CAV dataframe.
+    """
+    pos = cav[cav["r"] >= 0].nlargest(top_n_each, "r")
+    neg = cav[cav["r"] <  0].nsmallest(top_n_each, "r")
+    return pd.concat([pos, neg])
+
+
 def compare_with_cav(de_dir: Path, cav_dir: Path, out_path: str,
                      top_n: int = 200,
                      lfc_threshold: float = 1.5,
                      label_top_n: int = 8,
-                     highlight_genes: Optional[set] = None):
+                     highlight_genes: Optional[set] = None,
+                     show_continuum_genes: bool = False,
+                     continuum_top_n_each: int = 4,
+                     continuum_top_n_each_overrides: Optional[Dict[str, int]] = None,
+                     only_pairs: Optional[set] = None):
     """
     For each pair present in both de_dir and cav_dir, compute Spearman r
     between log2FC and CAV Pearson r across the top_n genes (by |log2FC|).
@@ -338,10 +477,19 @@ def compare_with_cav(de_dir: Path, cav_dir: Path, out_path: str,
       - Always labels the top label_top_n genes by distance from origin
         (high agreement in either direction).
       - Additionally highlights any genes in highlight_genes (by symbol).
+
+    only_pairs, if given, restricts the comparison (and the figure grid) to
+    that subset of pair labels -- useful for pulling out a handful of
+    representative cases into their own figure without rerunning DE.
     """
     de_files  = {f.stem: f for f in de_dir.glob("*.tsv")}
     cav_files = {f.stem: f for f in cav_dir.glob("*.tsv")}
     shared    = sorted(set(de_files) & set(cav_files))
+    if only_pairs:
+        missing = only_pairs - set(shared)
+        if missing:
+            logger.warning(f"  --only-pairs not found in both dirs: {sorted(missing)}")
+        shared = [p for p in shared if p in only_pairs]
 
     if not shared:
         logger.warning("No matching pair TSVs found between DE and CAV dirs.")
@@ -397,8 +545,30 @@ def compare_with_cav(de_dir: Path, cav_dir: Path, out_path: str,
             logger.warning(f"  {pair}: only {len(merged)} shared genes — skipping")
             continue
 
-        # Restrict to genes passing |log2FC| threshold
-        merged = merged.loc[merged["lfc"].abs() >= lfc_threshold].copy()
+        # Continuum genes: the exact top-N-each-by-r genes shown in the
+        # cav_continuum_viz.py strip plots for this pair. Determined from
+        # the CAV file directly (before the lfc threshold below) so they
+        # appear on the scatter even if their DE swing is small.
+        continuum_ids: set = set()
+        if show_continuum_genes:
+            n_each = continuum_top_n_each
+            if continuum_top_n_each_overrides:
+                for key, val in continuum_top_n_each_overrides.items():
+                    if key in pair:
+                        n_each = val
+                        break
+            continuum_df = continuum_genes_for_pair(cav, n_each)
+            continuum_ids = set(continuum_df["gene"])
+
+        # Restrict to genes passing |log2FC| threshold, but always keep
+        # continuum genes and explicitly highlighted genes so they remain
+        # visible on the plot regardless of their DE magnitude.
+        keep_mask = merged["lfc"].abs() >= lfc_threshold
+        if continuum_ids:
+            keep_mask = keep_mask | merged["gene"].isin(continuum_ids)
+        if highlight_genes:
+            keep_mask = keep_mask | merged["display"].isin(highlight_genes)
+        merged = merged.loc[keep_mask].copy()
 
         rho, pval = stats.spearmanr(merged["lfc"], merged["cav_r"])
         records.append({"pair": pair, "spearman_r": rho, "pval": pval,
@@ -407,12 +577,22 @@ def compare_with_cav(de_dir: Path, cav_dir: Path, out_path: str,
 
         ax = axes_flat[idx]
 
-        # Colour points: highlighted genes red, rest blue
         is_highlight = (merged["display"].isin(highlight_genes)
                         if highlight_genes else pd.Series(False, index=merged.index))
-        ax.scatter(merged.loc[~is_highlight, "lfc"],
-                   merged.loc[~is_highlight, "cav_r"],
+        is_continuum = (merged["gene"].isin(continuum_ids) & ~is_highlight
+                        if continuum_ids else pd.Series(False, index=merged.index))
+        is_background = ~is_highlight & ~is_continuum
+
+        # Colour points: highlighted (checkpoint) genes red stars,
+        # continuum genes gold circles, everything else background blue
+        ax.scatter(merged.loc[is_background, "lfc"],
+                   merged.loc[is_background, "cav_r"],
                    s=6, alpha=0.4, color="#2277bb", zorder=2)
+        if is_continuum.any():
+            ax.scatter(merged.loc[is_continuum, "lfc"],
+                       merged.loc[is_continuum, "cav_r"],
+                       s=26, alpha=0.9, facecolor="#f0a500", edgecolor="#7a5300",
+                       linewidths=0.6, zorder=3, marker="o")
         if is_highlight.any():
             ax.scatter(merged.loc[is_highlight, "lfc"],
                        merged.loc[is_highlight, "cav_r"],
@@ -436,12 +616,17 @@ def compare_with_cav(de_dir: Path, cav_dir: Path, out_path: str,
 
         auto_label = set(merged.nlargest(label_top_n, "dist").index)
         hl_label   = set(merged[is_highlight].index) if is_highlight.any() else set()
-        label_idx  = auto_label | hl_label
+        cont_label = set(merged[is_continuum].index) if is_continuum.any() else set()
+        label_idx  = auto_label | hl_label | cont_label
 
         for i in label_idx:
             row = merged.loc[i]
-            color = "#cc3333" if (highlight_genes and
-                                   row["display"] in highlight_genes) else "#333333"
+            if highlight_genes and row["display"] in highlight_genes:
+                color = "#cc3333"
+            elif i in cont_label:
+                color = "#7a5300"
+            else:
+                color = "#333333"
             ax.annotate(row["display"],
                         xy=(row["lfc"], row["cav_r"]),
                         xytext=(4, 4), textcoords="offset points",
@@ -453,9 +638,29 @@ def compare_with_cav(de_dir: Path, cav_dir: Path, out_path: str,
     for ax in axes_flat[len(shared):]:
         ax.set_visible(False)
 
-    plt.suptitle("DE log2FC vs. CAV gene correlation (top genes by |log2FC|)",
-                 fontsize=11, y=1.01)
-    plt.tight_layout()
+    legend_handles = [
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="#2277bb",
+               alpha=0.6, markersize=6, label="other genes (|log2FC| ≥ threshold)"),
+    ]
+    if show_continuum_genes:
+        legend_handles.append(
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#f0a500",
+                   markeredgecolor="#7a5300", markersize=7,
+                   label="top continuum gene (shown in strip plot)")
+        )
+    if highlight_genes:
+        legend_handles.append(
+            Line2D([0], [0], marker="*", color="w", markerfacecolor="#cc3333",
+                   markersize=10, label="curated highlight gene")
+        )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+
+    title = "DE log2FC vs. CAV gene correlation (top genes by |log2FC|)"
+    fig.suptitle(title, fontsize=11, y=0.995)
+    fig.legend(handles=legend_handles, loc="upper center",
+               bbox_to_anchor=(0.5, 0.975),
+               ncol=len(legend_handles), fontsize=8, frameon=False)
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     logger.info(f"Saved comparison scatter: {out_path}")
@@ -491,9 +696,20 @@ def main():
     parser.add_argument("--baseline-value", default="normal",
                         help="Value in condition-col that is baseline (default: normal)")
     parser.add_argument("--method",
-                        choices=["deseq2", "wilcoxon"], default="wilcoxon",
-                        help="DE method: deseq2 (pseudobulk, needs --donor-col) "
-                             "or wilcoxon (per-cell, default).")
+                        choices=["deseq2", "wilcoxon", "mixedlm"], default="wilcoxon",
+                        help="DE method: deseq2 (pseudobulk, needs --donor-col), "
+                             "wilcoxon (per-cell, default), or mixedlm (per-cell "
+                             "expression ~ condition with a donor random intercept -- "
+                             "needs --donor-col, more powerful than pseudobulk with "
+                             "few donors while still accounting for donor "
+                             "non-independence, unlike wilcoxon).")
+    parser.add_argument("--mixedlm-genes", nargs="*", default=None,
+                        help="Restrict --method mixedlm to these gene symbols "
+                             "(resolved via --gene-name-col). Omit to run "
+                             "genome-wide (slower: ~0.1-0.2s/gene/pair).")
+    parser.add_argument("--mixedlm-min-pct-cells", type=float, default=0.01,
+                        help="Skip genes detected in fewer than this fraction "
+                             "of cells in the pair before fitting (default: 0.01).")
     parser.add_argument("--out-dir",  required=True)
     parser.add_argument("--gene-name-col", default="",
                         help="adata.var column for human-readable gene names.")
@@ -524,6 +740,28 @@ def main():
                              "gene per line.")
     parser.add_argument("--heatmap-width",  type=float, default=14.0)
     parser.add_argument("--heatmap-height", type=float, default=10.0)
+    parser.add_argument("--show-continuum-genes", action="store_true",
+                        help="Highlight (gold circles) the exact top-N-each-by-r "
+                             "genes shown in the matching cav_continuum_viz.py "
+                             "strip plot for each pair, so the two figures can "
+                             "be cross-referenced gene-for-gene.")
+    parser.add_argument("--continuum-top-n-each", type=int, default=4,
+                        help="Default top-N-each (pos + neg by r) to mark as "
+                             "continuum genes (default: 4, matching the lung/"
+                             "breast/colorectal continuum figures).")
+    parser.add_argument("--only-pairs", nargs="*", default=None,
+                        help="Restrict the DE-vs-CAV comparison figure to these "
+                             "pair labels (e.g. neutrophil__breast__normal_vs_breast_cancer), "
+                             "pulling a subset out into its own figure without "
+                             "rerunning DE. Applies in both normal and --compare-only mode.")
+    parser.add_argument("--scatter-out", default=None,
+                        help="Override the output path for the comparison scatter "
+                             "PNG (and its sibling de_vs_cav_spearman.tsv, written "
+                             "alongside it). Default: <out-dir>/de_vs_cav_scatter.png.")
+    parser.add_argument("--continuum-top-n-each-override", nargs="*", default=None,
+                        help="Per-pair-substring overrides as key=value pairs, "
+                             "e.g. skin_epidermis=5 (melanoma continuum figure "
+                             "used top-n-each 5, not the default 4).")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -539,6 +777,18 @@ def main():
             highlight_genes = set(args.highlight_genes)
             logger.info(f"Highlighting genes: {highlight_genes}")
 
+    continuum_overrides = None
+    if args.continuum_top_n_each_override:
+        continuum_overrides = {}
+        for kv in args.continuum_top_n_each_override:
+            k, v = kv.split("=")
+            continuum_overrides[k] = int(v)
+
+    only_pairs = set(args.only_pairs) if args.only_pairs else None
+    scatter_out_path = Path(args.scatter_out) if args.scatter_out else (out_dir / "de_vs_cav_scatter.png")
+    if args.scatter_out:
+        scatter_out_path.parent.mkdir(parents=True, exist_ok=True)
+
     # --compare-only: skip DE, go straight to comparison plots
     if args.compare_only:
         if not args.cav_dir:
@@ -547,10 +797,14 @@ def main():
         compare_with_cav(
             de_dir          = out_dir,
             cav_dir         = Path(args.cav_dir),
-            out_path        = str(out_dir / "de_vs_cav_scatter.png"),
+            out_path        = str(scatter_out_path),
             lfc_threshold   = args.lfc_threshold,
             label_top_n     = args.label_top_n,
             highlight_genes = highlight_genes,
+            show_continuum_genes = args.show_continuum_genes,
+            continuum_top_n_each = args.continuum_top_n_each,
+            continuum_top_n_each_overrides = continuum_overrides,
+            only_pairs      = only_pairs,
         )
         logger.info("Done (compare-only).")
         return
@@ -575,6 +829,15 @@ def main():
     # Load h5ad
     adata, gene_name_map = load_adata(args.h5ad, args.gene_name_col)
     adata.obs.index = adata.obs.index.astype(str)
+
+    mixedlm_gene_ids = None
+    if args.method == "mixedlm" and args.mixedlm_genes:
+        name_to_id = {v: k for k, v in gene_name_map.items()}
+        mixedlm_gene_ids = [name_to_id[g] for g in args.mixedlm_genes if g in name_to_id]
+        missing = [g for g in args.mixedlm_genes if g not in name_to_id]
+        if missing:
+            logger.warning(f"  --mixedlm-genes not found: {missing}")
+        logger.info(f"  Restricting mixedlm to {len(mixedlm_gene_ids)} genes")
 
     # Normalise obs index for matching
     lfc_collection: Dict[str, pd.Series] = {}
@@ -614,6 +877,16 @@ def main():
                 result_df = run_deseq2_pair(
                     adata_pair, args.donor_col, args.condition_col,
                     args.baseline_value, min_donors=args.min_donors,
+                )
+            elif args.method == "mixedlm":
+                if not args.donor_col:
+                    logger.error("--donor-col required for mixedlm")
+                    sys.exit(1)
+                result_df = run_mixedlm_pair(
+                    adata_pair, args.donor_col, args.condition_col,
+                    args.baseline_value, gene_ids=mixedlm_gene_ids,
+                    min_donors=args.min_donors,
+                    min_pct_cells=args.mixedlm_min_pct_cells,
                 )
             else:
                 result_df = run_wilcoxon_pair(
@@ -668,10 +941,14 @@ def main():
         compare_with_cav(
             de_dir          = out_dir,
             cav_dir         = Path(args.cav_dir),
-            out_path        = str(out_dir / "de_vs_cav_scatter.png"),
+            out_path        = str(scatter_out_path),
             lfc_threshold   = args.lfc_threshold,
             label_top_n     = args.label_top_n,
             highlight_genes = highlight_genes,
+            show_continuum_genes = args.show_continuum_genes,
+            continuum_top_n_each = args.continuum_top_n_each,
+            continuum_top_n_each_overrides = continuum_overrides,
+            only_pairs      = only_pairs,
         )
 
     logger.info("Done.")

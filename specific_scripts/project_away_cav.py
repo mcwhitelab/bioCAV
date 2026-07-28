@@ -4,11 +4,20 @@ Remove one or more CAV directions from a target CAV (Gram-Schmidt orthogonalizat
 
 Answers questions like "What is MYC-like after removing generic bHLH-ness?"
 by subtracting the HLH component from the MYC CAV direction and renormalizing.
+Because Gram-Schmidt only removes the *correlated* component of the target
+with each away direction (target - (target . away) * away), this doubles as
+a "remove the common signal between two CAVs" tool: e.g. two interaction-
+interface CAVs each trained from a single example are often not specific
+enough on their own (they pick up shared/generic interface signal along with
+whatever is unique to that pair). Passing one as --target and the other as
+--away leaves only the target-specific residual.
 
 The output is a new CAV artifact directory that can be passed directly to
 query_proteins_by_cav.py. The scaler and PCA are copied from the target CAV,
 so this only makes sense when all CAVs share the same preprocessing (e.g.
-trained with a global scaler/PCA via run_cav_pipeline.py --pca-pkl).
+trained with a global scaler/PCA via run_cav_pipeline.py --pca-pkl, or with
+the same --scaler-pkl via train_cav_from_span.sh). The scaler is checked for
+a match between target and away CAVs before projecting.
 
 Usage
 -----
@@ -45,6 +54,20 @@ from src.evaluate import load_cav_artifacts
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def scalers_match(scaler_a, scaler_b) -> bool:
+    """
+    True if two fitted StandardScalers describe the same preprocessing space.
+
+    CAV vectors are only comparable (and Gram-Schmidt only meaningful) if
+    target and away were embedded/scaled identically — e.g. both trained
+    with the same --scaler-pkl.
+    """
+    return (
+        np.allclose(scaler_a.mean_, scaler_b.mean_)
+        and np.allclose(scaler_a.scale_, scaler_b.scale_)
+    )
 
 
 def orthogonalize(target: np.ndarray, directions: list[np.ndarray]) -> np.ndarray:
@@ -103,8 +126,19 @@ def main():
         logger.info(f"Loading away CAV: {away_dir}")
         away_artifacts = load_cav_artifacts(away_dir, version=args.version)
         away_vec = away_artifacts['concept_cav']
+
+        if not scalers_match(target_artifacts['scaler'], away_artifacts['scaler']):
+            raise ValueError(
+                f"Scaler mismatch between target ({args.target}) and away "
+                f"({away_dir}) — they were not trained with the same "
+                f"preprocessing, so their CAV directions don't live in the "
+                f"same space and can't be validly subtracted. Retrain both "
+                f"with the same --scaler-pkl."
+            )
+
         cos_sim = float(np.dot(target_vec, away_vec))
-        logger.info(f"  Cosine similarity to target: {cos_sim:.4f}")
+        logger.info(f"  Cosine similarity to target: {cos_sim:.4f}  "
+                    f"(the correlated/common component along this axis will be removed)")
         away_vecs.append(away_vec)
 
     # ------------------------------------------------------------------ #

@@ -104,12 +104,23 @@ def cells_matching(obs: pd.DataFrame,
 # Core correlation
 # ---------------------------------------------------------------------------
 
-def load_expression(h5ad_path: str, gene_name_col: str = "") -> tuple:
+def load_expression(h5ad_path: str, gene_name_col: str = "",
+                    normalize: bool = True, target_sum: float = 1e4) -> tuple:
     """
     Load gene expression matrix from h5ad.
     Returns (X_dense, gene_ids, cell_ids, gene_name_map).
     gene_name_map: dict {gene_id -> display_name} (empty if col not found).
     X is returned as float32 to reduce memory.
+
+    normalize: if True (default), library-size normalize each cell to
+    `target_sum` total counts, then log1p -- same convention used by
+    de_pseudobulk.py's mixedlm/wilcoxon methods. Without this, cells with
+    very different total RNA content (sequencing depth, doublets, cell
+    size) can dominate the correlation for any gene, independent of that
+    gene's own biology -- e.g. a gene can show a strong positive raw-count
+    correlation with the CAV axis purely because higher-scoring cells
+    happen to have far more total transcript captured overall, even while
+    that gene's *proportional* share of the transcriptome goes down.
     """
     import anndata as ad
     import scipy.sparse as sp
@@ -121,6 +132,13 @@ def load_expression(h5ad_path: str, gene_name_col: str = "") -> tuple:
     if sp.issparse(X):
         X = X.toarray()
     X = X.astype(np.float32)
+
+    if normalize:
+        lib_size = X.sum(axis=1, keepdims=True)
+        lib_size[lib_size == 0] = 1.0
+        X = X / lib_size * target_sum
+        X = np.log1p(X)
+        logger.info(f"  Library-size normalized (target_sum={target_sum:.0f}) + log1p")
 
     gene_ids = list(adata.var_names)
     cell_ids = list(adata.obs_names)
@@ -301,6 +319,13 @@ def main():
                         help="Skip pairs with fewer cells than this (default: 10)")
     parser.add_argument("--pairs", nargs="*", default=None,
                         help="Only run these baseline CAV names (default: all)")
+    parser.add_argument("--no-normalize", action="store_true",
+                        help="Correlate against raw counts instead of library-size "
+                             "normalized + log1p expression (default: normalize). "
+                             "Only for reproducing old/pre-fix output -- raw counts "
+                             "confound a gene's correlation with total per-cell "
+                             "library size, which can differ hugely between "
+                             "conditions for reasons unrelated to that gene.")
     parser.add_argument("--gene-name-col", default="",
                         help="adata.var column for human-readable gene names "
                              "(e.g. feature_name, gene_symbol). "
@@ -345,7 +370,7 @@ def main():
     # Load expression + obs
     # ------------------------------------------------------------------ #
     X_expr, gene_names, expr_cell_ids, gene_name_map = load_expression(
-        args.h5ad, gene_name_col=args.gene_name_col)
+        args.h5ad, gene_name_col=args.gene_name_col, normalize=not args.no_normalize)
     expr_id_to_row = {cid: i for i, cid in enumerate(expr_cell_ids)}
 
     obs_cols = list({args.group_col, args.context_col, args.condition_col})

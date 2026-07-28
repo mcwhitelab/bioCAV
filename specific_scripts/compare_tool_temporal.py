@@ -76,11 +76,14 @@ def compute_auc(pos_scores: np.ndarray, neg_scores: np.ndarray) -> float:
 # Load external tool predictions → long-format DataFrame
 # ---------------------------------------------------------------------------
 
-def load_tool_predictions(csv_path: str, go_terms_needed: set) -> pd.DataFrame:
+def load_tool_predictions(csv_path: str, go_terms_needed: set,
+                          threshold: float = 0.0) -> pd.DataFrame:
     """Read the wide CSV, keep only relevant GO columns, melt to long format.
 
     Returns a DataFrame with columns: protein_id (normalised), go_term, tool_score.
     Only rows where tool_score > 0 are returned (sparse representation).
+    If ``threshold`` > 0, additionally drop predictions scoring below it (e.g.
+    DeepGoWeb's suggested 0.1 minimum confidence).
     """
     logger.info(f"Reading external tool predictions: {csv_path}")
     wide = pd.read_csv(csv_path)
@@ -101,19 +104,27 @@ def load_tool_predictions(csv_path: str, go_terms_needed: set) -> pd.DataFrame:
     # Melt to long format; drop NaN / zero entries
     long = wide.melt(id_vars="protein_id", var_name="go_term", value_name="tool_score")
     long = long.dropna(subset=["tool_score"])
-    long = long[long["tool_score"] > 0].reset_index(drop=True)
+    long = long[long["tool_score"] > 0]
+    if threshold > 0:
+        n_before = len(long)
+        long = long[long["tool_score"] >= threshold]
+        logger.info(f"  Applied score threshold >= {threshold}: "
+                    f"{n_before} -> {len(long)} predictions")
+    long = long.reset_index(drop=True)
     long["tool_score"] = long["tool_score"].astype(float)
 
     logger.info(f"  Non-zero (protein, GO) predictions: {len(long)}")
     return long
 
 
-def load_tool_predictions_long(tsv_path: str, go_terms_needed: set) -> pd.DataFrame:
+def load_tool_predictions_long(tsv_path: str, go_terms_needed: set,
+                               threshold: float = 0.0) -> pd.DataFrame:
     """Read a headerless 3-column TSV (full_fasta_header, go_term, score).
 
     Returns a DataFrame with columns: protein_id (normalised), go_term, tool_score.
     Only rows where tool_score > 0 are returned. Duplicate (protein, GO) pairs
-    are resolved by keeping the maximum score.
+    are resolved by keeping the maximum score. If ``threshold`` > 0, additionally
+    drop predictions scoring below it.
     """
     logger.info(f"Reading long-format tool predictions: {tsv_path}")
     df = pd.read_csv(
@@ -129,7 +140,13 @@ def load_tool_predictions_long(tsv_path: str, go_terms_needed: set) -> pd.DataFr
     logger.info(f"  GO terms matching eval: {df['go_term'].nunique()}")
 
     df = df.dropna(subset=["tool_score"])
-    df = df[df["tool_score"] > 0].reset_index(drop=True)
+    df = df[df["tool_score"] > 0]
+    if threshold > 0:
+        n_before = len(df)
+        df = df[df["tool_score"] >= threshold]
+        logger.info(f"  Applied score threshold >= {threshold}: "
+                    f"{n_before} -> {len(df)} predictions")
+    df = df.reset_index(drop=True)
 
     df = df.groupby(["protein_id", "go_term"], as_index=False)["tool_score"].max()
 
@@ -176,6 +193,11 @@ def main():
                              "coexist in the same directory.")
     parser.add_argument("--llr-threshold", type=float, default=1.0,
                         help="LLR threshold for 'above threshold' in rank histogram (default: 1).")
+    parser.add_argument("--tool-score-threshold", type=float, default=0.0,
+                        help="Minimum tool score to count as a prediction (default: 0 = "
+                             "keep all nonzero). Predictions below this are dropped before "
+                             "AUC/AUPR/recall/rank computation and treated as 'not predicted'. "
+                             "E.g. 0.1 for DeepGoWeb's suggested minimum confidence.")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -197,9 +219,11 @@ def main():
     # Load tool predictions (long format, only nonzero scores)
     # ------------------------------------------------------------------
     if args.tool_format == "long_tsv":
-        tool_long = load_tool_predictions_long(args.tool_predictions, go_terms_needed=go_terms)
+        tool_long = load_tool_predictions_long(args.tool_predictions, go_terms_needed=go_terms,
+                                               threshold=args.tool_score_threshold)
     else:
-        tool_long = load_tool_predictions(args.tool_predictions, go_terms_needed=go_terms)
+        tool_long = load_tool_predictions(args.tool_predictions, go_terms_needed=go_terms,
+                                          threshold=args.tool_score_threshold)
 
     # ------------------------------------------------------------------
     # Join tool scores onto our validation pairs
@@ -431,6 +455,7 @@ def main():
             figure_data_dir=args.figure_data_dir,
             label=args.label,
             llr_threshold=args.llr_threshold,
+            tool_score_threshold=args.tool_score_threshold,
         )
     else:
         logger.info("Skipping rank scatter (pass --val-pkl, --go-base-dirs, --scaler-pkl to enable)")
@@ -474,6 +499,7 @@ def make_rank_scatter(
     figure_data_dir: str | None = None,
     label: str | None = None,
     llr_threshold: float = 1.0,
+    tool_score_threshold: float = 0.0,
 ) -> None:
     """
     For each (val protein, true GO term) pair, compute:
@@ -541,9 +567,11 @@ def make_rank_scatter(
     cav_go_set = set(cav_go_ids)
     logger.info(f"Re-loading tool predictions for {len(cav_go_set)} CAV GO terms")
     if tool_format == "long_tsv":
-        tool_long = load_tool_predictions_long(tool_predictions, go_terms_needed=cav_go_set)
+        tool_long = load_tool_predictions_long(tool_predictions, go_terms_needed=cav_go_set,
+                                               threshold=tool_score_threshold)
     else:
-        tool_long = load_tool_predictions(tool_predictions, go_terms_needed=cav_go_set)
+        tool_long = load_tool_predictions(tool_predictions, go_terms_needed=cav_go_set,
+                                          threshold=tool_score_threshold)
     logger.info(f"Tool predictions loaded: {len(tool_long)} rows")
 
     # ------------------------------------------------------------------

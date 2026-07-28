@@ -17,14 +17,18 @@ We present an automated approach for identifying and annotating motifs and domai
 ├── core/                    # Core CAV implementation
 │   └── src/                 # Source modules (attribution, detection, training, evaluation)
 ├── scripts/                 # Core pipeline scripts
+│   ├── fit_reference_scaler.py      # Fit shared scaler on reference population (setup)
+│   ├── fit_global_pca.py            # Optional: fit PCA on reference population
 │   ├── prepare_embeddings.py        # Pool per-residue embeddings by span
 │   ├── train_cav_from_embeddings.py # Train a CAV from positive/negative matrices
-│   ├── fit_global_pca.py            # Fit PCA on reference population
 │   ├── evaluate_cav.py              # Evaluate CAV performance
-│   ├── scan_sequence.py             # Sliding-window scan of a sequence
+│   ├── scan_sequence.py             # Sliding-window scan of a single sequence
 │   └── run_attribution.py           # Attribution analysis
 ├── specific_scripts/        # Specialized analysis and visualization scripts
-│   └── query_proteins_by_cav.py    # Rank/scan a FASTA against a trained CAV
+│   ├── query_proteins_by_cav.py     # Rank/scan a FASTA against trained CAV(s)
+│   ├── build_reference_population.py# Build the reference negative set
+│   └── pdb_bfactor_from_cav.py      # Write CAV scores into PDB B-factors
+├── docs/                    # Additional documentation
 ├── examples/                # Example input files (see Examples section)
 ├── test_data/               # Full benchmark dataset (60 Pfam motifs)
 └── test_data_small/         # Small subset for quick validation
@@ -38,44 +42,76 @@ cd bioCAV
 pip install -r core/requirements.txt
 ```
 
-## Pipeline
+## Prerequisites
 
-The pipeline has a one-time setup step (Step 00) followed by five per-concept steps (Steps 01–05).
+Two resources live outside this repository and must be provided:
 
-### Step 00 — Build reference negative population (one-time setup)
+| Resource | What it is |
+|----------|------------|
+| **PLM weights** | A local HuggingFace model directory, e.g. `ESMplusplus_large` |
+| **Embedding script** | `hf_embed_new.py` from `mcwlab_utils`, used for all embedding steps |
 
-Embed a large set of random/background proteins to use as negatives for all CAV training. Output lives in `reference_population/`.
+Set these once; every command below refers to them:
 
 ```bash
-conda activate /groups/clairemcwhite/envs/core_pkgs4
+export BIOCAV_REPO=/path/to/bioCAV
+export ESM_MODEL_DIR=/path/to/ESMplusplus_large
+export HF_EMBED_SCRIPT=/path/to/mcwlab_utils/hf_embed_new.py
+export REF_DIR=/path/to/reference_population     # created in Step 00
+```
 
-f=/groups/clairemcwhite/ahmad_workspace/esm_c/neg_data/neg_10000.fasta
+> **Lab members:** the concrete cluster paths, shared conda environment, and
+> the location of the prebuilt reference population are in
+> [`docs/internal_cluster_paths.md`](docs/internal_cluster_paths.md) — you do
+> not need to rebuild Step 00.
 
-# Select layer -11 (second-to-last layer), as in the paper
-python /groups/clairemcwhite/claire_workspace/github/mcwlab_utils/hf_embed_new.py \
-    -f $f \
-    -o reference_population/neg_10000.pkl \
-    -ss mean \
-    -s \
+## Pipeline
+
+A one-time setup (Step 00) followed by five per-concept steps (01–05).
+
+### Step 00 — Build the reference population (one-time setup)
+
+**00a. Embed a large background set** of random proteins to serve as negatives for all CAV training.
+
+```bash
+mkdir -p $REF_DIR
+
+python $HF_EMBED_SCRIPT \
+    -f neg_10000.fasta \
+    -o $REF_DIR/neg_10000.pkl \
+    --get_sequence_embeddings \
+    --strategy mean \
     -l -11 \
-    -m /groups/clairemcwhite/models/ESMplusplus_large \
+    -m $ESM_MODEL_DIR \
     -b 1 \
     --max_length 2048
 ```
 
-### Step 01 — Embed input FASTA
-
-Embed the protein(s) that define your concept. Both per-residue (AA) and sequence-level embeddings are needed for span pooling in Step 02.
+**00b. Fit the shared scaler.** Every CAV is trained in this one coordinate system, so that scores from different CAVs are directly comparable.
 
 ```bash
-python /groups/clairemcwhite/claire_workspace/github/mcwlab_utils/hf_embed_new.py \
+python $BIOCAV_REPO/scripts/fit_reference_scaler.py \
+    --neg $REF_DIR/neg_10000.pkl \
+    --out $REF_DIR/scaler_v1.pkl
+```
+
+> Step 00b is **required** — `train_cav_from_embeddings.py --scaler-pkl` in
+> Step 03 consumes `scaler_v1.pkl`. Skipping it means every CAV fits its own
+> scaler and scores are no longer comparable between concepts.
+
+### Step 01 — Embed input FASTA
+
+Embed the protein(s) that define your concept. Per-residue (`--get_aa_embeddings`) output is required for span pooling in Step 02.
+
+```bash
+python $HF_EMBED_SCRIPT \
     -f $INPUT_FASTA \
     -o ${INPUT_FASTA}.pkl \
     --get_aa_embeddings \
-    --get_sequence_embedding \
-    --strat mean \
+    --get_sequence_embeddings \
+    --strategy mean \
     -l -11 \
-    -m /groups/clairemcwhite/models/ESMplusplus_large \
+    -m $ESM_MODEL_DIR \
     -b 1 \
     --max_length 2048
 ```
@@ -85,54 +121,64 @@ python /groups/clairemcwhite/claire_workspace/github/mcwlab_utils/hf_embed_new.p
 Extract the region(s) defined in your span file and pool them into a positive embedding matrix.
 
 ```bash
-python $biocav_dir/scripts/prepare_embeddings.py \
+python $BIOCAV_REPO/scripts/prepare_embeddings.py \
     --pkl   ${INPUT_FASTA}.pkl \
     --info  ${INPUT_FASTA}.pkl.seqnames \
     --spans $SPAN_FILE \
-    --out   ${SPAN_FILE%.spans}_pos.npy
+    --out   ${SPAN_FILE%.span}_pos.npy
 ```
 
 ### Step 03 — Train CAV
 
-Train a linear classifier (CAV) separating the positive span embeddings from the reference negative population.
+Train a linear classifier separating the positive span embeddings from the reference negatives.
 
 ```bash
-python $biocav_dir/scripts/train_cav_from_embeddings.py \
-    --pos     ${SPAN_FILE%.spans}_pos.npy \
-    --neg     $ref_neg \
-    --out     $concept_dir \
-    --cv-folds 0 \
-    --pca-pkl  $ref_pca
+python $BIOCAV_REPO/scripts/train_cav_from_embeddings.py \
+    --pos        ${SPAN_FILE%.span}_pos.npy \
+    --neg        $REF_DIR/neg_10000.pkl \
+    --out        $concept_dir \
+    --cv-folds   0 \
+    --scaler-pkl $REF_DIR/scaler_v1.pkl
 ```
+
+**Choosing `--cv-folds`:** `0` skips cross-validation entirely — use it when you have one or very few positive examples (CV is meaningless there). With a substantial positive set (tens or more), use `5` to get a CV AUROC alongside the train AUROC.
 
 ### Step 04 — Embed search FASTA
 
-Embed the sequences you want to rank. Only sequence-level embeddings are needed here. This step is skipped automatically if the `.pkl` already exists.
+Embed the sequences you want to rank. Skipped automatically if the `.pkl` exists.
 
 ```bash
 if [ -f "$search_pkl" ]; then
     echo "Skipping embedding: $search_pkl already exists"
 else
-    python /groups/clairemcwhite/claire_workspace/github/mcwlab_utils/hf_embed_new.py \
+    python $HF_EMBED_SCRIPT \
         -f $SEARCH_FASTA \
         -o $search_pkl \
-        --get_sequence_embedding \
-        --strat mean \
+        --get_aa_embeddings \
+        --get_sequence_embeddings \
+        --strategy mean \
         -l -11 \
-        -m /groups/clairemcwhite/models/ESMplusplus_large \
+        -m $ESM_MODEL_DIR \
         -b 1 \
         --max_length 2048
 fi
 ```
 
-> **On-the-fly embedding:** For small search FASTAs you can skip pre-computing the pkl and pass `--fasta` directly to the query script (Step 05); it will embed on the fly.
+> **`--get_aa_embeddings` is required here** if you intend to use
+> `--sliding-window` in Step 05. Without per-residue embeddings the query
+> script exits with *"does not contain aa_embeddings"*. Sequence-level
+> embeddings alone suffice only for whole-sequence scoring.
+
+> **On-the-fly embedding:** for small search sets you can skip Step 04 and pass
+> `--embed-fasta $SEARCH_FASTA --embed-script $HF_EMBED_SCRIPT --model $ESM_MODEL_DIR`
+> to the query script instead of `--pkl`. It writes `<fasta>.pkl` as a side effect.
 
 ### Step 05 — Query search FASTA against CAV
 
-Score and rank every sequence (or every sliding window) in the search set against the trained CAV.
+Score and rank every sequence — or every sliding window — against the trained CAV.
 
 ```bash
-python $biocav_dir/specific_scripts/query_proteins_by_cav.py \
+python $BIOCAV_REPO/specific_scripts/query_proteins_by_cav.py \
     --cav   $concept_dir \
     --pkl   $search_pkl \
     --out   $out_tsv \
@@ -142,73 +188,122 @@ python $biocav_dir/specific_scripts/query_proteins_by_cav.py \
     --fasta $SEARCH_FASTA
 ```
 
-`--k -1` returns all results; `--sliding-window` enables per-window scoring; `--spans` and `--fasta` are used to annotate known positive regions in the output.
+| Flag | Effect |
+|------|--------|
+| `--k -1` | Return all results (default `100`) |
+| `--sliding-window` | Score each protein by its **best** window instead of its whole-sequence embedding. Requires `aa_embeddings` in the pkl |
+| `--spans` | **Sets the sliding-window size**, taken as the widest span in the file — not merely cosmetic |
+| `--fasta` | Supplies protein lengths, so windows stop at the true sequence end rather than running into padding |
+
+> **Window size is inherited from your span file.** A 39-residue concept scans
+> with a 39-residue window. If you want a different window, supply a spans file
+> of that width — this silently determines what the scan can detect.
 
 ### Full example wrapper
 
-A complete wrapper that sets variables and runs Steps 01–05 end-to-end:
-
 ```bash
 # -------------
-# Inputs — replace these placeholders before running
+# Inputs
 # -------------
-SPAN_FILE=fastas/pairs/myc_mad/MYC_HUMAN.fasta.spans
-INPUT_FASTA=fastas/pairs/myc_mad/MYC_HUMAN.fasta
-SEARCH_FASTA=/xdisk/clairemcwhite/clairemcwhite/uniprot_human_all.fasta
+SPAN_FILE=examples/RLK5_ARATH.fasta.span
+INPUT_FASTA=examples/RLK5_ARATH.fasta
+SEARCH_FASTA=/path/to/search_proteome.fasta
 
 # -------------
-# Paths
+# Paths (see Prerequisites)
 # -------------
-source ~/.bashrc
-conda activate /groups/clairemcwhite/envs/core_pkgs4
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export BIOCAV_REPO=/path/to/bioCAV
+export ESM_MODEL_DIR=/path/to/ESMplusplus_large
+export HF_EMBED_SCRIPT=/path/to/mcwlab_utils/hf_embed_new.py
+export REF_DIR=/path/to/reference_population
 
-biocav_dir=/groups/clairemcwhite/cav_workspace/bioCAV
-ref_neg=reference_population/neg_10000.pkl
-ref_pca=reference_population/global_pca_v1.pkl
-
-concept_dir=${SPAN_FILE%.spans}_concept
+concept_dir=${SPAN_FILE%.span}_concept
 search_pkl=${SEARCH_FASTA}.pkl
-out_tsv=${SPAN_FILE%.spans}_query_results.tsv
+out_tsv=${SPAN_FILE%.span}_query_results.tsv
 
 # Step 01
-if [ -f "${INPUT_FASTA}.pkl" ]; then
-    echo "Skipping embedding: ${INPUT_FASTA}.pkl already exists"
-else
-    python /groups/clairemcwhite/claire_workspace/github/mcwlab_utils/hf_embed_new.py \
+if [ ! -f "${INPUT_FASTA}.pkl" ]; then
+    python $HF_EMBED_SCRIPT \
         -f $INPUT_FASTA -o ${INPUT_FASTA}.pkl \
-        --get_aa_embeddings --get_sequence_embedding \
-        --strat mean -l -11 \
-        -m /groups/clairemcwhite/models/ESMplusplus_large \
-        -b 1 --max_length 2048
+        --get_aa_embeddings --get_sequence_embeddings \
+        --strategy mean -l -11 \
+        -m $ESM_MODEL_DIR -b 1 --max_length 2048
 fi
 
 # Step 02
-python $biocav_dir/scripts/prepare_embeddings.py \
+python $BIOCAV_REPO/scripts/prepare_embeddings.py \
     --pkl ${INPUT_FASTA}.pkl --info ${INPUT_FASTA}.pkl.seqnames \
-    --spans $SPAN_FILE --out ${SPAN_FILE%.spans}_pos.npy
+    --spans $SPAN_FILE --out ${SPAN_FILE%.span}_pos.npy
 
 # Step 03
-python $biocav_dir/scripts/train_cav_from_embeddings.py \
-    --pos ${SPAN_FILE%.spans}_pos.npy --neg $ref_neg \
-    --out $concept_dir --cv-folds 0 --pca-pkl $ref_pca
+python $BIOCAV_REPO/scripts/train_cav_from_embeddings.py \
+    --pos ${SPAN_FILE%.span}_pos.npy --neg $REF_DIR/neg_10000.pkl \
+    --out $concept_dir --cv-folds 0 --scaler-pkl $REF_DIR/scaler_v1.pkl
 
 # Step 04
-if [ -f "$search_pkl" ]; then
-    echo "Skipping embedding: $search_pkl already exists"
-else
-    python /groups/clairemcwhite/claire_workspace/github/mcwlab_utils/hf_embed_new.py \
+if [ ! -f "$search_pkl" ]; then
+    python $HF_EMBED_SCRIPT \
         -f $SEARCH_FASTA -o $search_pkl \
-        --get_sequence_embedding --strat mean -l -11 \
-        -m /groups/clairemcwhite/models/ESMplusplus_large \
-        -b 1 --max_length 2048
+        --get_aa_embeddings --get_sequence_embeddings \
+        --strategy mean -l -11 \
+        -m $ESM_MODEL_DIR -b 1 --max_length 2048
 fi
 
 # Step 05
-python $biocav_dir/specific_scripts/query_proteins_by_cav.py \
+python $BIOCAV_REPO/specific_scripts/query_proteins_by_cav.py \
     --cav $concept_dir --pkl $search_pkl --out $out_tsv \
     --k -1 --sliding-window --spans $SPAN_FILE --fasta $SEARCH_FASTA
 ```
+
+## Advanced options
+
+### Querying many CAVs at once
+
+`--cav` accepts multiple artifact directories. Passing a shared `--scaler-pkl`
+replaces the per-CAV loop with a single matrix multiply, which matters for
+library-scale runs (thousands of CAVs).
+
+```bash
+python $BIOCAV_REPO/specific_scripts/query_proteins_by_cav.py \
+    --cav cavs/GO_0000124/ cavs/GO_0003677/ cavs/GO_0005524/ \
+    --pkl $search_pkl \
+    --scaler-pkl $REF_DIR/scaler_v1.pkl \
+    --cav-name-depth 2 \
+    --cav-name-strip _positive_train_max1000_cav \
+    --out $out_tsv
+```
+
+`--cav-name-depth N` builds each output column name from the last *N* path
+components (useful when many CAVs share a directory name and the term ID lives
+one level up); `--cav-name-strip` removes a shared suffix from those names.
+
+### Length correction (motif dilution)
+
+Whole-sequence embeddings dilute a short motif's signal in proportion to protein
+length, so long proteins score lower for the same motif. `--length-correct`
+estimates the span embedding from the whole-sequence embedding and scores that
+instead.
+
+```bash
+python $BIOCAV_REPO/specific_scripts/query_proteins_by_cav.py \
+    --cav $concept_dir --pkl $search_pkl --out $out_tsv \
+    --length-correct --span-length 39 \
+    --fasta $SEARCH_FASTA --ref-pkl $REF_DIR/neg_10000.pkl
+```
+
+Note the converse bias in `--sliding-window` mode: a *max* over windows grows
+with the number of windows, so long proteins gain an advantage from having more
+chances. When ranking across a proteome, check whether score correlates with
+length before trusting the ordering.
+
+### Other scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/evaluate_cav.py` | Evaluate a trained CAV against labelled positives/negatives |
+| `scripts/scan_sequence.py` | Sliding-window scan of one sequence (per-residue profile) |
+| `scripts/run_attribution.py` | Attribution analysis for a CAV |
+| `specific_scripts/pdb_bfactor_from_cav.py` | Write CAV scores into PDB B-factors for structural visualisation |
 
 ## Examples
 
@@ -219,7 +314,6 @@ The `examples/` directory contains input files for a receptor-like kinase domain
 | `examples/RLK5_ARATH.fasta` | Input protein sequence (RLK5, *A. thaliana*) |
 | `examples/RLK5_ARATH.fasta.span` | Span defining the kinase domain (residues 404–591) |
 
-Run the pipeline with these files by setting:
 ```bash
 SPAN_FILE=examples/RLK5_ARATH.fasta.span
 INPUT_FASTA=examples/RLK5_ARATH.fasta
@@ -228,25 +322,39 @@ INPUT_FASTA=examples/RLK5_ARATH.fasta
 ## Input Formats
 
 ### FASTA
-Standard FASTA format. The accession in the header must match the accession used in the span file.
+
+Standard FASTA. The accession in the header must match the accession used in the span file.
 
 ```
 >sp|P47735|RLK5_ARATH Receptor-like protein kinase 5 ...
 MLYCLILLLC...
 ```
 
-### Span file (`.span`)
-Tab-separated, one span per line:
+### Span file
+
+Tab-separated, one entry per line, no header. All positions are **1-indexed**;
+window ranges are **inclusive**. Lines beginning with `#` are comments. Four
+modes are supported:
 
 ```
-<accession>	<start>	<end>
+accession                          # whole-sequence (no span)
+accession	pos                       # single position (e.g. a PTM site)
+accession	start	end                 # window [start, end], inclusive
+accession	p1,p2,p3,...              # position list — mean of exactly these residues
 ```
-
-The accession must match the FASTA header (full `sp|...|...` form or just the bare ID, depending on your embed script). Start and end are 1-based, inclusive residue positions.
 
 ```
 sp|P47735|RLK5_ARATH	404	591
 ```
+
+**The same accession may appear on multiple lines** — each line yields a
+separate embedding vector. This is how you supply several negative windows from
+one protein, or multiple PTM sites from one sequence.
+
+**Position-list mode is the right choice for alignment-derived spans.** When a
+region is mapped onto a homolog through an alignment, `start`–`end` also sweeps
+in any inserted residues that fall between the aligned columns; a position list
+pools only the residues that genuinely correspond.
 
 ## Models Supported
 

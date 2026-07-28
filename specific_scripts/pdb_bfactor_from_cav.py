@@ -2,31 +2,33 @@
 """
 Paint a PDB structure's B-factor column with per-residue CAV alignment scores.
 
-Computes a CAV projection score at every residue of a protein — optionally
-smoothed with the same sliding-window scan query_proteins_by_cav.py uses for
---sliding-window — and writes a new PDB file with those scores in the
-B-factor column, ready to color-by-attribute in ChimeraX/PyMOL.
+Extracts the sequence directly from the PDB chain, embeds it fresh (so the
+embedding always matches exactly the structure being painted, not a
+separately-maintained FASTA/pkl for a possibly different sequence), computes
+a CAV projection score at every residue — optionally smoothed with the same
+sliding-window scan query_proteins_by_cav.py uses for --sliding-window — and
+writes a new PDB file with those scores in the B-factor column, ready to
+color-by-attribute in ChimeraX/PyMOL.
 
-The residue count and order come directly from the PDB chain itself (no
-FASTA needed): residue i of the chain is scored against position i of the
---pkl's aa_embeddings, so this assumes the PDB is a single-chain structure
-of the same protein the embeddings were computed from (true for an
-AlphaFold model), with no missing internal residues.
+The extracted sequence and its embedding pkl are cached next to the PDB
+(<pdb>.fasta / <pdb>.fasta.pkl) and reused on subsequent runs.
 
 Usage
 -----
 # Windowed scan, inferring window size from the CAV's training spans file
 # (matches query_proteins_by_cav.py --sliding-window):
 python specific_scripts/pdb_bfactor_from_cav.py \\
-    --pdb       RLK5_ARATH_AF.pdb \\
-    --pkl       fastas/pairs/lrr/RLK5_ARATH.fasta.pkl \\
-    --cav-dir   fastas/pairs/lrr/RLK5_ARATH.fasta_concept \\
-    --spans     fastas/pairs/lrr/RLK5_ARATH.fasta.span \\
-    --out       RLK5_ARATH_cav_bfactor.pdb
+    --pdb          RLK5_ARATH_AF.pdb \\
+    --cav-dir      fastas/pairs/lrr/RLK5_ARATH.fasta_concept \\
+    --spans        fastas/pairs/lrr/RLK5_ARATH.fasta.span \\
+    --embed-script /path/to/hf_embed_new.py \\
+    --model        /path/to/ESMplusplus_large \\
+    --out          RLK5_ARATH_cav_bfactor.pdb
 
 # Per-residue, no windowing (--window-size 1):
 python specific_scripts/pdb_bfactor_from_cav.py \\
-    --pdb RLK5_ARATH_AF.pdb --pkl ... --cav-dir ... \\
+    --pdb RLK5_ARATH_AF.pdb --cav-dir ... \\
+    --embed-script ... --model ... \\
     --window-size 1 --out RLK5_ARATH_cav_bfactor.pdb
 
 Then in ChimeraX:
@@ -35,6 +37,7 @@ Then in ChimeraX:
 """
 
 import sys
+import subprocess
 import argparse
 import logging
 import numpy as np
@@ -120,6 +123,54 @@ def load_pdb_chain(pdb_path: str, chain_id: str = None):
     return structure, chain, residues
 
 
+def pdb_chain_sequence(residues) -> str:
+    """One-letter sequence for a list of Bio.PDB residues, in chain order."""
+    from Bio.PDB.Polypeptide import protein_letters_3to1_extended
+    seq = []
+    for r in residues:
+        seq.append(protein_letters_3to1_extended.get(r.get_resname(), 'X'))
+    return ''.join(seq)
+
+
+def embed_pdb_sequence(pdb_path: str, sequence: str, seq_id: str,
+                       embed_script: str, model: str,
+                       layer: int, batch: int, max_length: int) -> str:
+    """
+    Write the PDB's sequence to a FASTA next to it, embed it with
+    hf_embed_new.py, and return the resulting pkl path. Both the FASTA and
+    the pkl are cached and reused on subsequent runs.
+    """
+    fasta_path = Path(pdb_path).with_suffix('.fasta')
+    pkl_path = fasta_path.with_suffix('.fasta.pkl')
+
+    if not fasta_path.exists():
+        with open(fasta_path, 'w') as f:
+            f.write(f">{seq_id}\n{sequence}\n")
+        logger.info(f"Wrote PDB-derived sequence: {fasta_path}")
+    else:
+        logger.info(f"Reusing existing sequence FASTA: {fasta_path}")
+
+    if pkl_path.exists():
+        logger.info(f"Skipping embedding: {pkl_path} already exists")
+        return str(pkl_path)
+
+    logger.info(f"Embedding {fasta_path} -> {pkl_path}")
+    cmd = [
+        sys.executable, embed_script,
+        "-f", str(fasta_path),
+        "-o", str(pkl_path),
+        "--get_aa_embeddings",
+        "--get_sequence_embedding",
+        "--strat", "mean",
+        "-l", str(layer),
+        "-m", model,
+        "-b", str(batch),
+        "--max_length", str(max_length),
+    ]
+    subprocess.run(cmd, check=True)
+    return str(pkl_path)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Paint a PDB's B-factor column with per-residue CAV scores.",
@@ -127,10 +178,6 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument('--pdb', required=True, help='Input PDB file (e.g. AlphaFold model).')
-    parser.add_argument('--pkl', required=True, help='Pkl with aa_embeddings for the protein.')
-    parser.add_argument('--accession', default=None,
-                        help='Accession/ID to select from --pkl. Auto-detected if the pkl '
-                             'has exactly one entry.')
     parser.add_argument('--cav-dir', required=True, help='Trained CAV artifact directory.')
     parser.add_argument('--version', default='v1', help='CAV artifact version (default: v1).')
     parser.add_argument('--window-size', type=int, default=None,
@@ -143,6 +190,19 @@ def main():
     parser.add_argument('--stride', type=int, default=1, help='Window stride (default: 1).')
     parser.add_argument('--chain', default=None,
                         help='PDB chain ID to paint (default: first chain in the structure).')
+
+    # On-the-fly embedding of the PDB's own sequence
+    parser.add_argument('--embed-script', required=True,
+                        help='Path to hf_embed_new.py.')
+    parser.add_argument('--model', required=True,
+                        help='Model directory for embedding.')
+    parser.add_argument('--embed-layer', type=int, default=-11,
+                        help='Layer index for embedding (default: -11).')
+    parser.add_argument('--embed-batch', type=int, default=1,
+                        help='Batch size for embedding (default: 1).')
+    parser.add_argument('--embed-max-length', type=int, default=2048,
+                        help='Max sequence length for embedding (default: 2048).')
+
     parser.add_argument('--out', required=True, help='Output PDB path.')
     args = parser.parse_args()
 
@@ -150,40 +210,27 @@ def main():
         parser.error("Pass only one of --window-size / --spans.")
 
     # ------------------------------------------------------------------ #
-    # 1. Parse the PDB — its residue count/order is the source of truth
+    # 1. Parse the PDB and pull its sequence directly (source of truth)
     # ------------------------------------------------------------------ #
     structure, chain, residues = load_pdb_chain(args.pdb, args.chain)
     seq_len = len(residues)
+    sequence = pdb_chain_sequence(residues)
+    seq_id = f"{Path(args.pdb).stem}_{chain.id}"
 
     # ------------------------------------------------------------------ #
-    # 2. Resolve accession and load embeddings for that protein
+    # 2. Embed that sequence fresh
     # ------------------------------------------------------------------ #
-    embeddings, sample_ids = load_embeddings_pkl(args.pkl)
+    pkl_path = embed_pdb_sequence(
+        args.pdb, sequence, seq_id,
+        args.embed_script, args.model,
+        args.embed_layer, args.embed_batch, args.embed_max_length,
+    )
+
+    embeddings, sample_ids = load_embeddings_pkl(pkl_path)
     if 'aa_embeddings' not in embeddings:
-        raise ValueError(f"{args.pkl} does not contain aa_embeddings. "
-                          "Re-embed with --get_aa_embeddings.")
-
-    if args.accession:
-        accession = args.accession
-        if accession not in sample_ids:
-            raise ValueError(f"{accession} not found in {args.pkl}. "
-                              f"Available: {sample_ids[:5]}{'...' if len(sample_ids) > 5 else ''}")
-    else:
-        if len(sample_ids) != 1:
-            raise ValueError(f"{args.pkl} has {len(sample_ids)} entries — pass --accession "
-                              f"to pick one. Available: {sample_ids[:10]}")
-        accession = sample_ids[0]
-        logger.info(f"Using the only entry in {args.pkl}: {accession}")
-
-    idx = sample_ids.index(accession)
+        raise ValueError(f"{pkl_path} does not contain aa_embeddings.")
+    idx = sample_ids.index(seq_id)
     aa_emb = embeddings['aa_embeddings'][idx]
-
-    if seq_len > aa_emb.shape[0]:
-        raise ValueError(
-            f"PDB chain '{chain.id}' has {seq_len} residues but {accession}'s aa_embeddings "
-            f"only cover {aa_emb.shape[0]} positions — wrong PDB/pkl pair, or the embedding "
-            f"was truncated (check --max_length on the original embed step)."
-        )
 
     # ------------------------------------------------------------------ #
     # 3. Score every residue against the CAV
