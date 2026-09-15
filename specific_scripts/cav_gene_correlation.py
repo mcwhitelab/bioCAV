@@ -114,7 +114,7 @@ def load_expression(h5ad_path: str, gene_name_col: str = "",
 
     normalize: if True (default), library-size normalize each cell to
     `target_sum` total counts, then log1p -- same convention used by
-    de_pseudobulk.py's mixedlm/wilcoxon methods. Without this, cells with
+    de_methods.py's mixedlm/wilcoxon methods. Without this, cells with
     very different total RNA content (sequencing depth, doublets, cell
     size) can dominate the correlation for any gene, independent of that
     gene's own biology -- e.g. a gene can show a strong positive raw-count

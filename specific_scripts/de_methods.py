@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-de_pseudobulk.py — Standard pseudobulk differential expression for each
-tissue × cell-type × normal-vs-cancer pair, using the same pair enumeration
-as cav_gene_correlation.py (from library_structure.json).
+de_methods.py — Normal-vs-cancer differential expression for each
+tissue × cell-type pair, using the same pair enumeration as
+cav_gene_correlation.py (from library_structure.json).
 
-Two methods available:
+(Renamed from de_pseudobulk.py 2026-09-13: the file offers three methods, and
+the one the paper actually uses — --method mixedlm — is not pseudobulk. The old
+name made the Methods section read as though a pseudobulk test had been run.)
+
+Three methods available:
   --method deseq2    Pseudobulk DESeq2 via pydeseq2 (preferred).
                      Aggregates raw counts per donor, runs DESeq2.
                      Requires: pip install pydeseq2
+  --method mixedlm   Per-gene linear mixed model, log2(CP10K + 1) ~ condition
+                     with a random intercept per donor. This is the method the
+                     paper's Figure 6 uses; see run_mixedlm_pair for why.
+                     Requires: --donor-col
   --method wilcoxon  Per-cell Wilcoxon rank-sum via scanpy (fallback).
                      No donor column required.
                      log2FC = log2((mean_cancer + 1e-9) / (mean_normal + 1e-9))
@@ -21,17 +29,17 @@ Output mirrors cav_gene_correlation.py for direct comparison:
 
 Usage
 -----
-python specific_scripts/de_pseudobulk.py \\
+python specific_scripts/de_methods.py \\
     --h5ad          cav_library/.../data/cells.h5ad \\
     --lib-dir       cav_library/.../ \\
     --group-col     cell_type \\
     --context-col   tissue \\
     --condition-col disease \\
     --donor-col     donor_id \\
-    --out-dir       cav_library/.../results/de_pseudobulk/
+    --out-dir       cav_library/.../results/de_vs_cav/
 
 # Compare with CAV gene correlations:
-python specific_scripts/de_pseudobulk.py \\
+python specific_scripts/de_methods.py \\
     ... \\
     --cav-dir  cav_library/.../results/gene_correlation/ \\
     --out-dir  cav_library/.../results/de_vs_cav/
