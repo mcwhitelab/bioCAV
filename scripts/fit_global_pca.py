@@ -2,14 +2,17 @@
 """
 Fit a global StandardScaler + PCA on a reference embedding pkl.
 
-Pass the resulting pkl to train_cav_from_embeddings.py --pca-pkl so that
-all CAVs share the same coordinate system and are directly comparable.
+Pass the resulting pkl to train_cav_from_embeddings.py --pca-pkl to train CAVs
+in the top-k principal components of the reference population. The scaler is
+fit on the same pkl as fit_reference_scaler.py, so it matches scaler_v1.pkl
+when both are built from the same reference set. PCA uses an exact SVD.
 
 Usage
 -----
 python scripts/fit_global_pca.py \\
     --pkl  reference_population/neg_10000.pkl \\
-    --out  reference_population/global_pca_v1.pkl
+    --out  reference_population/global_pca_128.pkl \\
+    --pca-dim 128
 """
 
 import sys
@@ -52,7 +55,7 @@ def main():
     X_scaled = scaler.fit_transform(embs)
 
     actual_dim = min(args.pca_dim, embs.shape[0], embs.shape[1])
-    pca = PCA(n_components=actual_dim, random_state=args.seed)
+    pca = PCA(n_components=actual_dim, svd_solver='full', random_state=args.seed)
     pca.fit(X_scaled)
     var_explained = pca.explained_variance_ratio_.sum()
     logger.info(f"PCA({actual_dim}) explains {var_explained:.1%} of variance")

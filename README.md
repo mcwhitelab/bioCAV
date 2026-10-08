@@ -18,7 +18,7 @@ We present an automated approach for identifying and annotating motifs and domai
 │   └── src/                 # Source modules (attribution, detection, training, evaluation)
 ├── scripts/                 # Core pipeline scripts
 │   ├── fit_reference_scaler.py      # Fit shared scaler on reference population (setup)
-│   ├── fit_global_pca.py            # Optional: fit PCA on reference population
+│   ├── fit_global_pca.py            # Optional: fit scaler+PCA on reference population (--pca-pkl)
 │   ├── prepare_embeddings.py        # Pool per-residue embeddings by span
 │   ├── train_cav_from_embeddings.py # Train a CAV from positive/negative matrices
 │   ├── evaluate_cav.py              # Evaluate CAV performance
@@ -99,6 +99,17 @@ python $BIOCAV_REPO/scripts/fit_reference_scaler.py \
 > Step 03 consumes `scaler_v1.pkl`. Skipping it means every CAV fits its own
 > scaler and scores are no longer comparable between concepts.
 
+**00c (optional). Fit a reference PCA** if you plan to train CAVs from very few
+positives (see [Regularization and PCA](#regularization-and-pca)). The bundle
+holds a scaler fit on the same reference set, so it matches `scaler_v1.pkl`.
+
+```bash
+python $BIOCAV_REPO/scripts/fit_global_pca.py \
+    --pkl     $REF_DIR/neg_10000.pkl \
+    --out     $REF_DIR/global_pca_128.pkl \
+    --pca-dim 128
+```
+
 ### Step 01 — Embed input FASTA
 
 Embed the protein(s) that define your concept. Per-residue (`--get_aa_embeddings`) output is required for span pooling in Step 02.
@@ -142,6 +153,56 @@ python $BIOCAV_REPO/scripts/train_cav_from_embeddings.py \
 ```
 
 **Choosing `--cv-folds`:** `0` skips cross-validation entirely — use it when you have one or very few positive examples (CV is meaningless there). With a substantial positive set (tens or more), use `5` to get a CV AUROC alongside the train AUROC.
+
+#### Regularization and PCA
+
+**`--C` (default: 1/n_train).** The CAV is an L2-regularized logistic regression.
+sklearn sums the loss over training samples, so the effective regularization is
+roughly 1/(C·n): a fixed `C` regularizes a 50-sample problem far more heavily
+than a 10,000-sample one. The default `C = 1/n_train` holds C·n = 1 constant.
+With the 10k reference negatives that is ≈1e-4, the value used for the GO, EC
+and Pfam CAV libraries in the paper. Override it only deliberately. If you train
+against a small custom negative set, keep the default: a fixed `C=1e-4` with
+n≈30 regularizes so hard that the CAV collapses to the difference of class
+means. `report_v1.json` records `C` and whether it came from the default
+(`C_rule`).
+
+**Convergence.** The solver runs to convergence (lbfgs, `tol=1e-10`,
+`max_iter=1e5`). These problems are close to linearly separable, and at
+sklearn's default `tol=1e-4` lbfgs stops after a few dozen iterations, at a
+point where the CAV *direction* depends on the stopping rule rather than on
+the data. `report_v1.json` records `n_iter` and `converged`. A warning is
+logged if `max_iter` is hit.
+
+**`--pca-pkl` (optional).** With very few positives (a single protein, or a
+handful of spans), the full-dimensional direction can lock onto features unique to
+those few sequences rather than the shared concept. `--pca-pkl` trains the CAV
+in the top-k principal components of the reference population (from Step 00c),
+which restricts it to axes of variation the background actually spans:
+
+```bash
+python $BIOCAV_REPO/scripts/train_cav_from_embeddings.py \
+    --pos     ${SPAN_FILE%.span}_pos.npy \
+    --neg     $REF_DIR/neg_10000.pkl \
+    --out     ${concept_dir}_pca128 \
+    --cv-folds 0 \
+    --scaler-pkl $REF_DIR/scaler_v1.pkl \
+    --pca-pkl    $REF_DIR/global_pca_128.pkl
+```
+
+The k-d direction is folded back into the full space (`Pᵀw`, unit-normalized)
+and saved as `concept_v1.npy`, which ranks identically to the PC-space CAV. A
+PCA CAV is therefore scored exactly like any other (Step 05, `--scaler-pkl`
+batch mode included). The k-d vector is kept as `concept_pca_v1.npy`, and
+`pca_dim` / `pca_var_explained` are recorded in the report. If `--scaler-pkl`
+is also given, it must match the bundle's scaler.
+
+Choosing k. For the single-positive MYC bHLH concept in the paper, k ≤ 16
+was too coarse to separate the concept and results were stable from about
+k = 96 to 160. k = 128 is a reasonable starting point. With a new
+few-positive concept, try a small sweep (e.g. 32, 64, 128, 256, no PCA)
+against a labelled control set before trusting one setting. Concepts with
+many positives (the GO/EC/Pfam libraries) are trained without PCA.
 
 ### Step 04 — Embed search FASTA
 
