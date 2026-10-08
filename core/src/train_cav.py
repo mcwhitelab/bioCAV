@@ -7,7 +7,7 @@ import json
 import joblib
 import logging
 from pathlib import Path
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, Optional
 from datetime import datetime
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score, StratifiedKFold, train_test_split
@@ -17,6 +17,22 @@ import hashlib
 from .utils.preprocessing import create_scaler
 
 logger = logging.getLogger(__name__)
+
+# lbfgs at sklearn's default tol=1e-4 stops after ~15-50 iterations on these nearly separable
+# problems, and the CAV direction then depends on the stopping rule. Fit to convergence.
+DEFAULT_TOL = 1e-10
+DEFAULT_MAX_ITER = 100000
+
+
+def default_C(n_train: int) -> float:
+    """C = 1 / n_train.
+
+    sklearn's objective is 0.5*||w||^2 + C * sum_i loss_i (a SUMMED loss), so the effective
+    regularisation is ~1/(C*n). C = 1/n keeps C*n = 1 whatever the training-set size. With the
+    shared 10k background this is ~1e-4, the value used for the GO/EC/Pfam libraries; a
+    fixed C=1e-4 on a small custom set (e.g. n=32) shrinks the CAV to the class-mean difference.
+    """
+    return 1.0 / n_train
 
 
 def load_embeddings(
@@ -51,10 +67,12 @@ def load_embeddings(
 def train_concept_cav(
     X_train: np.ndarray,
     y_train: np.ndarray,
-    C: float = 1.0,
+    C: Optional[float] = None,
     cv_folds: int = 5,
     random_seed: int = 42,
     class_weight: str = "balanced",
+    tol: float = DEFAULT_TOL,
+    max_iter: int = DEFAULT_MAX_ITER,
 ) -> Tuple[LogisticRegression, Dict]:
     """
     Train concept CAV using logistic regression.
@@ -62,7 +80,8 @@ def train_concept_cav(
     Args:
         X_train: Training embeddings (preprocessed)
         y_train: Labels
-        C: Regularization strength
+        C: Inverse regularization strength. None (default) = 1 / n_train
+            (see default_C); the same C is used for the CV folds and the final fit.
         cv_folds: Number of CV folds
         random_seed: Random seed
         class_weight: Passed to LogisticRegression.  "balanced" (default)
@@ -71,13 +90,19 @@ def train_concept_cav(
             regardless of how many reference cells were used.  This is
             especially important with a large fixed reference population
             (e.g. 10k cells) vs. a small positive set (e.g. 200 cells).
+        tol, max_iter: lbfgs stopping rule; defaults fit to convergence.
 
     Returns:
         Tuple of (fitted_model, metrics_dict)
     """
+    C_rule = "1/n_train" if C is None else "user"
+    if C is None:
+        C = default_C(len(X_train))
+    logger.info(f"LogisticRegression C = {C:.3g} ({C_rule}, n_train = {len(X_train)})")
     clf = LogisticRegression(
         C=C,
-        max_iter=1000,
+        tol=tol,
+        max_iter=max_iter,
         random_state=random_seed,
         solver='lbfgs',
         class_weight=class_weight,
@@ -96,6 +121,9 @@ def train_concept_cav(
         cv_auroc_scores = []
 
     clf.fit(X_train, y_train)
+    n_iter = int(clf.n_iter_[0])
+    if n_iter >= max_iter:
+        logger.warning(f"lbfgs hit max_iter={max_iter} without converging (tol={tol})")
 
     y_pred_proba = clf.predict_proba(X_train)[:, 1]
     train_auroc = roc_auc_score(y_train, y_pred_proba)
@@ -109,7 +137,13 @@ def train_concept_cav(
         'train_auprc': float(train_auprc),
         'n_train': len(X_train),
         'n_positive': int(y_train.sum()),
-        'n_negative': int((1 - y_train).sum())
+        'n_negative': int((1 - y_train).sum()),
+        'C': float(C),
+        'C_rule': C_rule,
+        'tol': tol,
+        'max_iter': max_iter,
+        'n_iter': n_iter,
+        'converged': n_iter < max_iter,
     }
 
     if cv_auroc_mean is not None:
@@ -247,7 +281,7 @@ def train_cav(
     concept_model, concept_metrics = train_concept_cav(
         X_scaled,
         y_train,
-        C=config.get('regularization_C', 1.0),
+        C=config.get('regularization_C'),
         cv_folds=config.get('cv_folds', 5),
         random_seed=config.get('random_seed', 42),
         class_weight=config.get('class_weight', 'balanced'),

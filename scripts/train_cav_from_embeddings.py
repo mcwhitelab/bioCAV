@@ -70,8 +70,11 @@ def main():
                         help='Output directory for CAV artifacts')
     parser.add_argument('--holdout', type=float, default=0.0,
                         help='Fraction to hold out for evaluation (default: 0)')
-    parser.add_argument('--C', type=float, default=1.0,
-                        help='Logistic regression regularization strength (default: 1.0)')
+    parser.add_argument('--C', type=float, default=None,
+                        help='Logistic regression inverse regularization strength '
+                             '(default: 1/n_train, i.e. ~1e-4 with the shared 10k background). '
+                             'sklearn sums the loss over samples, so a fixed C means different '
+                             'regularization at different n; set it explicitly only on purpose.')
     parser.add_argument('--cv-folds', type=int, default=5,
                         help='Cross-validation folds (default: 5); use 0 to skip CV entirely (e.g. single positive example)')
     parser.add_argument('--seed', type=int, default=42,

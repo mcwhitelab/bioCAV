@@ -68,6 +68,7 @@ DIRECT_ASSAY_CODES = {
 CAV_SUBDIR = "random_positive_train_max1000_cav"
 POS_SPAN   = "random_positive_test_max1000.span"
 NEG_SPAN   = "random_negative_test_max1000.span"
+TRAIN_SPAN = "random_positive_train_max1000.span"
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +234,16 @@ def main():
     parser.add_argument("--filter-evidence", action="store_true",
                         help="Restrict to direct/experimental ECO evidence codes. "
                              "Off by default (use when your file is not already pre-filtered).")
+    parser.add_argument("--go-terms-file", default=None,
+                        help="Restrict evaluation to the GO terms listed in this file (one per "
+                             "line). Use to hold the benchmark term set fixed when CAVs for "
+                             "additional terms have since been trained.")
+    parser.add_argument("--exclude-known-positives", action="store_true",
+                        help="Drop (protein, term) pairs where the protein is already a proFAB "
+                             "positive for that term (random train or test span; built from "
+                             "Swiss-Prot <= 2020-01 with true-path propagation). A post-cutoff "
+                             "annotation date does not by itself mean the pair is new. "
+                             "--min-n is re-applied afterwards.")
     parser.add_argument("--retrieve-script",
                         default=str(Path(__file__).parent / "retrieve_fasta.py"),
                         help="Path to retrieve_fasta.py.")
@@ -296,8 +307,48 @@ def main():
                 f"{len(skipped_no_dir)} no directory | "
                 f"{len(skipped_no_cav)} no CAV dir")
 
+    if args.go_terms_file:
+        fixed = set(Path(args.go_terms_file).read_text().split())
+        n_before = len(valid_go_terms)
+        valid_go_terms = [g for g in valid_go_terms if g in fixed]
+        logger.info(f"  --go-terms-file: {n_before} → {len(valid_go_terms)} GO terms "
+                    f"({len(fixed)} listed)")
+
     gold     = gold[gold["go_term"].isin(valid_go_terms)].copy()
     go_terms = valid_go_terms
+
+    if args.exclude_known_positives:
+        def _read_span(path: Path) -> set:
+            if not path.exists():
+                return set()
+            ids = set()
+            for line in path.read_text().split():
+                parts = [x for x in line.split("|") if x and x not in {"sp", "tr", "sw", "ref"}]
+                ids.add(parts[0] if parts else line)
+            return ids
+
+        drop_train, drop_test, keep_mask = 0, 0, []
+        known = {}
+        for go_id in go_terms:
+            go_dir = find_go_dir(go_id, go_base_dirs)
+            known[go_id] = (_read_span(go_dir / TRAIN_SPAN), _read_span(go_dir / POS_SPAN))
+        for pid, go_id in zip(gold["protein_id"], gold["go_term"]):
+            train_ids, test_ids = known[go_id]
+            if pid in train_ids:
+                drop_train += 1; keep_mask.append(False)
+            elif pid in test_ids:
+                drop_test += 1; keep_mask.append(False)
+            else:
+                keep_mask.append(True)
+        before = len(gold)
+        gold = gold[keep_mask].copy()
+        counts = gold.groupby("go_term")["protein_id"].nunique()
+        go_terms = sorted(counts[counts >= args.min_n].index)
+        gold = gold[gold["go_term"].isin(go_terms)].copy()
+        logger.info(f"Known-positive exclusion: dropped {drop_train} pairs in proFAB train "
+                    f"positives, {drop_test} in proFAB test positives; "
+                    f"{before} → {len(gold)} pairs, {len(valid_go_terms)} → {len(go_terms)} "
+                    f"GO terms after re-applying --min-n {args.min_n}")
     logger.info(f"  Proteins to retrieve after CAV filter: {gold['protein_id'].nunique()}")
 
     # ------------------------------------------------------------------
